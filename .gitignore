@@ -1,0 +1,18 @@
+/utility_file
+/wandb
+/output
+/checkpoints
+/3DGAN
+/data
+./cache
+/evaluation_reports
+run_evaluation.sh
+run_visualization.sh
+
+# キャッシュ、重みファイル
+.cache/
+*.pth
+
+# Pythonのコンパイル済みファイル
+__pycache__/
+*.pyc

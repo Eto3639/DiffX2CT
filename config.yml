@@ -1,0 +1,29 @@
+SEED: 42
+PROJECT_NAME: "3D-CT-Diffusion-Unet-testtraining"
+EPOCHS: 30
+BATCH_SIZE: 1
+VALIDATION_SPLIT: 0.2
+MAX_GRAD_NORM: 1.0
+NUM_WORKERS: 8
+
+DATA:
+  PT_DATA_DIR: "/workspace/data/LIDC/dataset_256/CT_pt"
+  DRR_DIR: "/workspace/data/LIDC/dataset_256/DRR_mod"
+
+TRAINING:
+  ENCODER: "convnext"  # 使用するエンコーダー (resnet, convnext, efficientnet)
+  PATCH_SIZE: 160 # ★ 変更点: パッチサイズを128から160に増加
+  LOSS_PHASE_EPOCHS: [10, 20] # 損失関数を切り替えるエポック
+  L1_SSIM_RATIO: 0.5 # L1損失とSSIM損失の割合 (L1 * ratio + SSIM * (1-ratio))
+  # --- Optunaから移動したハイパーパラメータ ---
+  LEARNING_RATE: 0.0001
+  WEIGHT_DECAY: 0.00001
+  GRADIENT_ACCUMULATION_STEPS: 4
+
+OPTUNA:
+  N_TRIALS: 20 # Optunaの試行回数
+  PARAMS:
+    # 探索するハイパーパラメータの範囲
+    gradient_accumulation_steps: [1, 2, 4, 8] # (参考: Optuna使用時の設定)
+    lr: [1.0e-5, 5.0e-4]
+    weight_decay: [1.0e-6, 1.0e-2]
