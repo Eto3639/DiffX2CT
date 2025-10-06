@@ -65,7 +65,8 @@ def visualize_and_save_mpr(device, params, scheduler_name, ct_full, drr1, drr2, 
     ct_full, drr1, drr2, pos_3d = ct_full.to(device), drr1.to(device), drr2.to(device), pos_3d.to(device)
     
     # ★ 変更点: SlidingWindowInfererを使用してフルボリュームを推論
-    patch_size = (params['patch_size'], params['patch_size'], params['patch_size'])
+    patch_size_val = CONFIG["TRAINING"]["PATCH_SIZE"]
+    patch_size = (patch_size_val, patch_size_val, patch_size_val)
     inferer = SlidingWindowInferer(roi_size=patch_size, sw_batch_size=1, overlap=0.5)
 
     # 5. 推論を実行
@@ -191,11 +192,12 @@ def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
 # --- 学習・評価関数 ---
 def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint=None): # noqa: E501
     BATCH_SIZE = CONFIG["BATCH_SIZE"]
-    patch_size_val = params["patch_size"] # configから直接渡される
+    patch_size_val = CONFIG["TRAINING"]["PATCH_SIZE"]
     PATCH_SIZE = (patch_size_val, patch_size_val, patch_size_val)
-    lr = params["learning_rate"]
+    lr = params["lr"]
     weight_decay = params["weight_decay"]
     gradient_accumulation_steps = params["gradient_accumulation_steps"]
+    l1_ssim_ratio = params["l1_ssim_ratio"]
 
     SAVE_PATH = f"./checkpoints/trial_{trial_number}"
     os.makedirs(SAVE_PATH, exist_ok=True)
@@ -255,7 +257,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     optimizer = torch.optim.AdamW(model_params, lr=lr, weight_decay=weight_decay)
 
     scheduler = DDPMScheduler(num_train_timesteps=1000)
-    ssim_metric = StructuralSimilarityIndexMeasure(data_range=400).to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     scaler = GradScaler() # ★ 高速化: GradScalerを初期化
 
     if resume_from_checkpoint:
@@ -292,15 +294,13 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
 
     for epoch in range(CONFIG["EPOCHS"]):
         distributed_model.train()
-        # --- ★ 変更: L2損失に一時的に固定 ---
-        # # 元のコード: 現在のエポックに基づいて損失タイプを決定
-        # if epoch < l2_end_epoch:
-        #     current_loss_type = 'l2'
-        # elif epoch < l1_end_epoch:
-        #     current_loss_type = 'l1'
-        # else:
-        #     current_loss_type = 'l1_ssim'
-        current_loss_type = 'l2' # L2損失に固定
+        # 元のコード: 現在のエポックに基づいて損失タイプを決定
+        if epoch < l2_end_epoch:
+            current_loss_type = 'l2'
+        elif epoch < l1_end_epoch:
+            current_loss_type = 'l1'
+        else:
+            current_loss_type = 'l1_ssim'
 
         train_loss_epoch = 0.0
         
@@ -316,18 +316,16 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 context = distributed_model.conditioning_encoder(drr1, drr2)
                 predicted_noise = checkpoint(distributed_model, noisy_ct, timesteps, context, pos_3d, use_reentrant=False)
 
-                # --- ★ 変更: L2損失に一時的に固定 ---
-                loss = F.mse_loss(predicted_noise, noise)
-                # # 元のコード:
-                # if current_loss_type == 'l1':
-                #     loss = F.l1_loss(predicted_noise, noise)
-                # elif current_loss_type == 'l2':
-                #     loss = F.mse_loss(predicted_noise, noise)
-                # else: # 'l1_ssim'
-                #     l1_loss = F.l1_loss(predicted_noise, noise)
-                #     denoised_ct = scheduler.step(predicted_noise, timesteps, noisy_ct).pred_original_sample
-                #     ssim_loss = 1.0 - ssim_metric(denoised_ct, ct_patch)
-                #     loss = CONFIG["TRAINING"]["L1_SSIM_RATIO"] * l1_loss + (1 - CONFIG["TRAINING"]["L1_SSIM_RATIO"]) * ssim_loss
+                # 元のコード:
+                if current_loss_type == 'l1':
+                    loss = F.l1_loss(predicted_noise, noise)
+                elif current_loss_type == 'l2':
+                    loss = F.mse_loss(predicted_noise, noise)
+                else: # 'l1_ssim'
+                    l1_loss = F.l1_loss(predicted_noise, noise)
+                    denoised_ct = scheduler.step(predicted_noise, timesteps, noisy_ct).pred_original_sample
+                    ssim_loss = 1.0 - ssim_metric(denoised_ct, ct_patch)
+                    loss = l1_ssim_ratio * l1_loss + (1 - l1_ssim_ratio) * ssim_loss
                 
                 # 勾配蓄積のために損失をスケーリング
                 loss = loss / gradient_accumulation_steps
@@ -406,24 +404,31 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     
     return best_val_loss
 
-# --- main関数 (ファイル検索とデータ同期を修正) ---
-def main(args):
-    # コマンドライン引数からresume_from_checkpointのみを取得するように変更
-    parser = argparse.ArgumentParser(description="Train a conditioned diffusion model.")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to a checkpoint directory to resume training from.")
-    args = parser.parse_args()
+# --- Optunaの目的関数 ---
+def objective(trial, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint):
+    # Optunaで探索するハイパーパラメータを定義
+    params = {
+        "l1_ssim_ratio": trial.suggest_float("l1_ssim_ratio", *CONFIG["OPTUNA"]["PARAMS"]["l1_ssim_ratio"]),
+        "lr": trial.suggest_float("lr", *CONFIG["OPTUNA"]["PARAMS"]["lr"], log=True),
+        "weight_decay": trial.suggest_float("weight_decay", *CONFIG["OPTUNA"]["PARAMS"]["weight_decay"], log=True),
+        "gradient_accumulation_steps": trial.suggest_categorical("gradient_accumulation_steps", CONFIG["OPTUNA"]["PARAMS"]["gradient_accumulation_steps"]),
+        "patch_size": CONFIG["TRAINING"]["PATCH_SIZE"] # patch_sizeは固定
+    }
 
+    # train_and_evaluate を呼び出し、検証損失を返す
+    # trial.number を渡して、各トライアルのチェックポイントを個別に保存
+    return train_and_evaluate(params, trial.number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint)
+
+# --- main関数 (Optuna実行) ---
+def main(args):
     # --- cuDNNエラー回避のための設定 ---
     torch.backends.cudnn.benchmark = False
     print("ℹ️ Set torch.backends.cudnn.benchmark = False to avoid potential cuDNN errors.")
 
-    # --- ★ 変更点: configからデータセット設定を読み込む ---
     data_config = CONFIG["DATA"]
     pt_dir = Path(data_config["PT_DATA_DIR"])
     drr_dir = Path(data_config["DRR_DIR"])
 
-    # --- ファイル検索とデータ分割 ---
     print(f"🔍 Searching for all preprocessed tensor files in: {pt_dir}")
     all_pt_files = sorted(list(pt_dir.glob("*.pt")))
     
@@ -444,40 +449,25 @@ def main(args):
         verified_file_paths, test_size=CONFIG["VALIDATION_SPLIT"], random_state=CONFIG["SEED"]
     )
 
-    # Optuna学習ループ
-    # config.ymlから設定を読み込む
     encoder_name = CONFIG["TRAINING"]["ENCODER"]
     loss_phase_epochs = CONFIG["TRAINING"]["LOSS_PHASE_EPOCHS"]
     
-    # --- ★ 変更点: Optunaを無効化し、config.ymlから直接パラメータを読み込む ---
-    print("--- Running a single training session (Optuna is disabled) ---")
+    # Optuna Studyの作成
+    study = optuna.create_study(direction="minimize")
     
-    # パラメータをconfig.ymlから取得
-    params = {
-        "patch_size": CONFIG["TRAINING"]["PATCH_SIZE"],
-        "learning_rate": CONFIG["TRAINING"]["LEARNING_RATE"],
-        "weight_decay": CONFIG["TRAINING"]["WEIGHT_DECAY"],
-        "gradient_accumulation_steps": CONFIG["TRAINING"]["GRADIENT_ACCUMULATION_STEPS"],
-    }
-    
-    # トライアル番号は0に固定（またはタイムスタンプなど）
-    trial_number = 0 
-    
-    # シードを設定
-    set_seed(CONFIG["SEED"])
-    print(f"Setting seed to {CONFIG['SEED']}")
-    
-    # 学習と評価を実行
-    result = train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, args.resume_from_checkpoint)
+    # 最適化の実行
+    # lambdaを使って、objectiveに追加の引数を渡す
+    objective_func = lambda trial: objective(trial, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, args.resume_from_checkpoint)
+    study.optimize(objective_func, n_trials=CONFIG["OPTUNA"]["N_TRIALS"])
 
-    print("\n--- Training Finished ---")
-    print(f"Final Validation Loss: {result:.4f}")
+    print("\n--- Optuna Study Finished ---")
+    print(f"Best trial: {study.best_trial.value}")
+    print("Best hyperparameters: ", json.dumps(study.best_trial.params, indent=4))
 
 if __name__ == '__main__':
     set_seed(CONFIG["SEED"])
-    # コマンドライン引数からresume_from_checkpointのみを取得するように変更
-    parser = argparse.ArgumentParser(description="Train a conditioned diffusion model.")
+    parser = argparse.ArgumentParser(description="Train a conditioned diffusion model with Optuna.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to a checkpoint directory to resume training from.")
+                        help="Path to a checkpoint directory to resume training from (Note: Optuna trials will manage their own checkpoints).")
     cli_args = parser.parse_args()
     main(cli_args)
