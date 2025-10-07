@@ -198,6 +198,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     weight_decay = params["weight_decay"]
     gradient_accumulation_steps = params["gradient_accumulation_steps"]
     l1_ssim_ratio = params["l1_ssim_ratio"]
+    max_grad_norm = params["max_grad_norm"]
 
     SAVE_PATH = f"./checkpoints/trial_{trial_number}"
     os.makedirs(SAVE_PATH, exist_ok=True)
@@ -331,8 +332,8 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 loss = loss / gradient_accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n🔥 NaN or Inf loss detected at epoch {epoch+1}, step {step}. Aborting trial.")
-                return float('inf')
+                print(f"\n🔥 NaN or Inf loss detected at epoch {epoch+1}, step {step}. Pruning trial.")
+                raise optuna.exceptions.TrialPruned()
 
             # ★ 高速化: scalerを使って勾配を計算
             scaler.scale(loss).backward()
@@ -343,7 +344,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             if (step + 1) % gradient_accumulation_steps == 0:
                 # ★ 高速化: scalerを使って勾配をクリップし、オプティマイザをステップ
                 scaler.unscale_(optimizer) # unscaleしてクリッピング
-                torch.nn.utils.clip_grad_norm_(model_params, CONFIG["MAX_GRAD_NORM"])
+                torch.nn.utils.clip_grad_norm_(model_params, max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -408,6 +409,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
 def objective(trial, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint):
     # Optunaで探索するハイパーパラメータを定義
     params = {
+        "max_grad_norm": trial.suggest_float("max_grad_norm", *CONFIG["OPTUNA"]["PARAMS"]["max_grad_norm"]),
         "l1_ssim_ratio": trial.suggest_float("l1_ssim_ratio", *CONFIG["OPTUNA"]["PARAMS"]["l1_ssim_ratio"]),
         "lr": trial.suggest_float("lr", *CONFIG["OPTUNA"]["PARAMS"]["lr"], log=True),
         "weight_decay": trial.suggest_float("weight_decay", *CONFIG["OPTUNA"]["PARAMS"]["weight_decay"], log=True),
@@ -452,8 +454,16 @@ def main(args):
     encoder_name = CONFIG["TRAINING"]["ENCODER"]
     loss_phase_epochs = CONFIG["TRAINING"]["LOSS_PHASE_EPOCHS"]
     
-    # Optuna Studyの作成
-    study = optuna.create_study(direction="minimize")
+    # Optuna Studyの作成 (SQLiteバックエンドで再開可能に)
+    study_name = args.study_name
+    storage_name = f"sqlite:///{study_name}.db"
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_name,
+        load_if_exists=True,
+        direction="minimize"
+    )
+    print(f"Optuna study '{study_name}' is using storage: {storage_name}")
     
     # 最適化の実行
     # lambdaを使って、objectiveに追加の引数を渡す
@@ -467,6 +477,7 @@ def main(args):
 if __name__ == '__main__':
     set_seed(CONFIG["SEED"])
     parser = argparse.ArgumentParser(description="Train a conditioned diffusion model with Optuna.")
+    parser.add_argument("--study_name", type=str, default="diffx2ct-optimization", help="Name for the Optuna study.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to a checkpoint directory to resume training from (Note: Optuna trials will manage their own checkpoints).")
     cli_args = parser.parse_args()
