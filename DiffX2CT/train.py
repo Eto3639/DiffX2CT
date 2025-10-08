@@ -141,12 +141,14 @@ def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, p
             if is_distributed:
                 # 分散モデル用の推論関数
                 context = model_for_inference.conditioning_encoder(drr1, drr2)
-                model_func = lambda x: model_for_inference(x=x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
+                # ★ 修正: infererから渡されるパッチごとのpos_3dを受け取るようにlambdaを修正
+                model_func = lambda x, pos_3d: model_for_inference(x=x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
                 model_output = inferer(inputs=image, network=model_func)
             else:
                 # 単一GPUモデル用の推論関数
                 context = model_for_inference['conditioning_encoder'](drr1, drr2)
-                model_func = lambda x: model_for_inference['unet'](x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
+                # ★ 修正: infererから渡されるパッチごとのpos_3dを受け取るようにlambdaを修正
+                model_func = lambda x, pos_3d: model_for_inference['unet'](x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
                 model_output = inferer(inputs=image, network=model_func)
             
             image = scheduler.step(model_output, t, image).prev_sample
@@ -163,7 +165,7 @@ def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, p
 
     print("  De-normalizing images to HU range...")
     # ターゲットのHU範囲
-    min_hu = -1024
+    min_hu = -1000 # ★ 修正: ユーザーの要求に合わせて-1000に変更
     max_hu = 1500
 
     # 6b. [0, 1] の範囲から [min_hu, max_hu] の範囲にスケール変換
