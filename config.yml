@@ -1,5 +1,5 @@
 SEED: 42
-PROJECT_NAME: "3D-CT-Diffusion-Unet-testtraining"
+PROJECT_NAME: "3D-CT-Diffusion-Unet-patch128"
 EPOCHS: 30
 BATCH_SIZE: 1
 VALIDATION_SPLIT: 0.2
@@ -12,13 +12,16 @@ DATA:
 
 TRAINING:
   ENCODER: "convnext"  # 使用するエンコーダー (resnet, convnext, efficientnet)
-  PATCH_SIZE: 160 # ★ 変更点: パッチサイズを128から160に増加
+  PATCH_SIZE: 128 # ★ 変更点: パッチサイズを128から160に増加
   LOSS_PHASE_EPOCHS: [10, 20] # 損失関数を切り替えるエポック
   L1_SSIM_RATIO: 0.5 # L1損失とSSIM損失の割合 (L1 * ratio + SSIM * (1-ratio))
   # --- Optunaから移動したハイパーパラメータ ---
-  LEARNING_RATE: 0.0001
-  WEIGHT_DECAY: 0.00001
-  GRADIENT_ACCUMULATION_STEPS: 4
+  LEARNING_RATE: 0.0002
+  WEIGHT_DECAY: 0.01
+  GRADIENT_ACCUMULATION_STEPS: 8
+  patch_overlap: 0.5 # パッチのオーバーラップ率 (0.0 ~ 1.0)
+  blend_mode: 'cosine' # 推論時のブレンディングモード ('constant', 'gaussian', 'cosine')
+  scheduler_name: 'cosine' # スケジューラの種類 ('linear', 'cosine')
 
 OPTUNA:
   N_TRIALS: 20 # Optunaの試行回数

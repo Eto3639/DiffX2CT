@@ -12,44 +12,45 @@ from einops import rearrange
 # -----------------------------------------------------------------------------
 
 class SinusoidalPositionEmbeddings3D(nn.Module):
-    """ 3D座標用の正弦波位置埋め込み """
+    """
+    入力された3つの1D座標ベクトルから、3Dの正弦波位置埋め込みマップを生成する。
+    出力は (B, C, D, H, W) の形状を持つ。
+    """
     def __init__(self, dim):
         super().__init__()
-        self.dim = dim
+        assert dim % 6 == 0, "Embedding dimension must be divisible by 6"
+        self.dim_per_axis = dim // 3
 
-    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+    def forward(self, pos_3d_vectors: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            coords (torch.Tensor): 形状 (B, 3) の座標テンソル (d, h, w)
+            pos_3d_vectors (torch.Tensor): 形状 (B, 3, N) の座標ベクトル (d, h, w)
         """
-        device = coords.device
-        # ★ 変更点: 埋め込み次元を各軸に分割するロジックを修正
-        # self.dimが6で割り切れない場合に対応
-        dims_per_axis = self.dim // 3
-        remaining_dim = self.dim % 3
-        dims = [dims_per_axis] * 3
-        for i in range(remaining_dim):
-            dims[i] += 1
-        
+        device = pos_3d_vectors.device
+        b, _, n = pos_3d_vectors.shape
+        half_dim = self.dim_per_axis // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+
         all_embs = []
-        for i, axis_dim in enumerate(dims):
-            # ★ 変更点: 奇数の次元が割り当てられた場合、sin/cosで切り捨てられないように調整
-            if axis_dim % 2 != 0:
-                axis_dim -=1 # 偶数にする
-            
-            half_dim = axis_dim // 2
-            embeddings = math.log(10000) / (half_dim - 1)
-            embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-            axis_coords = coords[:, i:i+1] # (B, 1)
-            axis_embs = axis_coords * embeddings[None, :] # (B, half_dim)
-            all_embs.append(torch.cat([axis_embs.sin(), axis_embs.cos()], dim=-1))
-        
-        # ★ 変更点: 最終的な次元数がself.dimと一致するようにパディング
-        result = torch.cat(all_embs, dim=-1)
-        if result.shape[1] < self.dim:
-            padding = torch.zeros(result.shape[0], self.dim - result.shape[1], device=device)
-            result = torch.cat([result, padding], dim=1)
-        return result
+        for i in range(3): # d, h, w
+            axis_coords = pos_3d_vectors[:, i, :] # (B, N)
+            axis_embs = axis_coords.unsqueeze(-1) * embeddings.unsqueeze(0) # (B, N, half_dim)
+            axis_embs = torch.cat([axis_embs.sin(), axis_embs.cos()], dim=-1) # (B, N, dim_per_axis)
+            all_embs.append(axis_embs)
+
+        emb_d, emb_h, emb_w = all_embs
+        # (B, N, C) -> (B, C, N)
+        emb_d = emb_d.permute(0, 2, 1).view(b, self.dim_per_axis, n, 1, 1)
+        emb_h = emb_h.permute(0, 2, 1).view(b, self.dim_per_axis, 1, n, 1)
+        emb_w = emb_w.permute(0, 2, 1).view(b, self.dim_per_axis, 1, 1, n)
+
+        # ブロードキャストを利用して (B, C, D, H, W) のマップを生成
+        # ★ 修正: 各軸の埋め込みを足し算ではなく、チャンネル方向に結合する
+        emb_d_map = emb_d.repeat(1, 1, 1, n, n)
+        emb_h_map = emb_h.repeat(1, 1, n, 1, n)
+        emb_w_map = emb_w.repeat(1, 1, n, n, 1)
+        return torch.cat([emb_d_map, emb_h_map, emb_w_map], dim=1)
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -221,15 +222,16 @@ class DiffusionModelUNet(nn.Module):
         )
 
         # ★ 追加: 3D位置埋め込み
-        self.pos_mlp_3d = nn.Sequential(
-            SinusoidalPositionEmbeddings3D(time_embed_dim),
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
+        # チャンネル数を入力チャンネル数に合わせる
+        # ★ 修正: 6で割り切れるように次元を調整
+        base_pos_embed_dim = num_channels[0]
+        pos_embed_dim = (base_pos_embed_dim + 5) // 6 * 6
+
+        self.pos_emb_3d = SinusoidalPositionEmbeddings3D(dim=pos_embed_dim)
 
         # 入力層
-        self.init_conv = nn.Conv3d(in_channels, num_channels[0], kernel_size=3, padding=1)
+        # ★ 変更: 入力チャンネル数を位置埋め込み分だけ増やす
+        self.init_conv = nn.Conv3d(in_channels + pos_embed_dim, num_channels[0], kernel_size=3, padding=1)
         
         # Encoder (Down blocks)
         self.down_blocks = nn.ModuleList()
@@ -290,9 +292,10 @@ class DiffusionModelUNet(nn.Module):
         t = self.time_mlp(timesteps)
 
         # ★ 追加: 3D位置埋め込みを計算し、時間埋め込みに加算
+        # ★ 変更: 3D位置埋め込みを計算し、入力xに結合する
         if pos_3d is not None:
-            p = self.pos_mlp_3d(pos_3d)
-            t = t + p
+            p = self.pos_emb_3d(pos_3d)
+            x = torch.cat([x, p], dim=1)
 
         x = self.init_conv(x)
         

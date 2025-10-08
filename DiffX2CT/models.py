@@ -17,8 +17,7 @@ class DistributedUNet(nn.Module):
 
         # --- 新しい分散戦略に基づいてモデルを再配置 ---
         # GPU 0: 入出力に近い層
-        self.conditioning_encoder = conditioning_encoder.to(self.device0)
-        self.pos_mlp_3d = unet.pos_mlp_3d.to(self.device0)
+        self.conditioning_encoder = conditioning_encoder.to(self.device0) # ★ 変更: pos_mlp_3dはunetの一部として扱う
         self.time_mlp = unet.time_mlp.to(self.device0)
         self.init_conv = unet.init_conv.to(self.device0)
         self.down_block_0 = unet.down_blocks[0].to(self.device0)
@@ -38,15 +37,25 @@ class DistributedUNet(nn.Module):
         self.mid_block2 = unet.mid_block2.to(self.device2)
         self.up_block_0 = unet.up_blocks[0].to(self.device2)
 
+        # ★ 追加: unetのpos_emb_3dをGPU0に配置
+        self.pos_emb_3d = unet.pos_emb_3d.to(self.device0)
+
     def forward(self, x, timesteps, context, pos_3d):
         # --- GPU 0 ---
-        t = self.time_mlp(timesteps) + self.pos_mlp_3d(pos_3d)
-        x = self.init_conv(x)
+        # ★ 変更: 時間埋め込みと位置埋め込みを計算し、入力に結合する
+        x = x.to(self.device0)
+        t = self.time_mlp(timesteps.to(self.device0))
+        
+        # 3D位置埋め込みマップを計算
+        p = self.pos_emb_3d(pos_3d.to(self.device0))
+        # 入力xと位置埋め込みマップをチャンネル方向に結合
+        x = torch.cat([x, p], dim=1)
+        x = self.init_conv(x) # 位置情報が結合された状態で最初の畳み込み
         
         skip_connections = []
         
         # Down Block 0 on GPU 0
-        skip_x0, x = self.down_block_0(x, t, context)
+        skip_x0, x = self.down_block_0(x, t, context.to(self.device0))
         skip_connections.append(skip_x0)
 
         # --- Data to GPU 1 ---
@@ -92,6 +101,6 @@ class DistributedUNet(nn.Module):
         context = context.to(self.device0)
 
         # Up Block 3 and Out Conv on GPU 0
-        x = self.up_block_3(x, skip_connections.pop().to(self.device0), t, context)
+        x = self.up_block_3(x, skip_connections.pop().to(self.device0), t, context) # ★ 修正: popする順番を修正
         output = self.out_conv(x)
         return output

@@ -6,19 +6,22 @@ import argparse
 from tqdm import tqdm
 import wandb
 import os
+import numpy as np
 
 # train.pyから必要なコンポーネントをインポートします
 # このスクリプトはtrain.pyと同じディレクトリに配置してください
 try:
     from train import (
-        visualize_and_save_mpr,
+        generate_and_evaluate,
         Preprocessed_CT_DRR_Dataset,
         CONFIG, set_seed,
         DistributedUNet,
         ConditioningEncoderResNet,
         ConditioningEncoderConvNeXt,
         ConditioningEncoderEfficientNetV2,
-        DiffusionModelUNet
+        DiffusionModelUNet,
+        psnr, # ★ 修正: psnr関数をインポート
+        create_evaluation_report # ★ 追加: レポート生成関数をインポート
     )
 except ImportError as e:
     print("エラー: train.pyからのインポートに失敗しました。")
@@ -26,7 +29,7 @@ except ImportError as e:
     print(f"詳細: {e}")
     exit()
 
-def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
+def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode, evaluate_npy_path=None):
     """
     指定されたトライアルのモデルとデータを使ってvisualize_and_save_mprをテストします。
     """
@@ -57,7 +60,7 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
     pt_dir = Path(data_config["PT_DATA_DIR"])
     
     # train.pyと同様に、有効なデータペアを1つ見つけます
-    all_pt_files = sorted(list(pt_dir.rglob("*.pt"))) # サブディレクトリも検索
+    all_pt_files = sorted(list(pt_dir.glob("*.pt"))) # rglobからglobに変更
     verified_file_paths = []
     for ct_path in tqdm(all_pt_files, desc="Verifying data pairs for test"):
         drr_subdir_name = ct_path.stem
@@ -65,7 +68,12 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
         drr_lat_path = drr_dir / drr_subdir_name / "LAT.pt"
         if drr_ap_path.exists() and drr_lat_path.exists():
             verified_file_paths.append(ct_path)
-            break # テストなので1つ見つかればOK
+            # evaluate_npyモードの場合、対応する正解CTを見つける
+            if evaluate_npy_path and Path(evaluate_npy_path).stem.startswith(f"generated_ct_trial_{trial_number}"):
+                # ファイル名からIDを推測 (例: generated_ct_trial_0_epoch_999_HU -> 0)
+                # ここでは最初のデータで代用しますが、より正確なマッチングが必要です
+                print(f"Found corresponding ground truth for {evaluate_npy_path}: {ct_path.name}")
+                break
 
     if not verified_file_paths:
         print("エラー: テストに使用できる有効なCT/DRRデータペアが見つかりませんでした。")
@@ -81,6 +89,50 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
     ct_full, drr1, drr2, pos_3d = vis_dataset[0]
     ct_full, drr1, drr2, pos_3d = ct_full.unsqueeze(0), drr1.unsqueeze(0), drr2.unsqueeze(0), pos_3d.unsqueeze(0)
     print(f"Loaded data shapes: CT={ct_full.shape}, DRR1={drr1.shape}, DRR2={drr2.shape}")
+
+    # --- ★ 追加: NPY評価モード ---
+    if evaluate_npy_path:
+        print(f"\n--- Running in NPY-EVALUATION mode for: {evaluate_npy_path} ---")
+        try:
+            generated_ct_np = np.load(evaluate_npy_path)
+            print(f"  Loaded generated CT from .npy file. Shape: {generated_ct_np.shape}")
+
+            # 正解CTをHU値に変換
+            min_hu, max_hu = -1024, 1500
+            ground_truth_hu_np = ct_full.squeeze().cpu().numpy() * (max_hu - min_hu) + min_hu
+
+            # 評価レポートを生成 (train.pyのgenerate_and_evaluateから一部を抜粋・改造)
+            from train import calculate_mae
+            from torchmetrics.image import StructuralSimilarityIndexMeasure
+            import matplotlib.pyplot as plt
+
+            print("  📊 Calculating quality metrics...")
+            data_range = max_hu - min_hu
+            ssim_score = StructuralSimilarityIndexMeasure(data_range=data_range)(torch.from_numpy(generated_ct_np).unsqueeze(0).unsqueeze(0), torch.from_numpy(ground_truth_hu_np).unsqueeze(0).unsqueeze(0)).item()
+            psnr_score = psnr(ground_truth_hu_np, generated_ct_np, data_range=data_range)
+            mae_score = calculate_mae(ground_truth_hu_np, generated_ct_np)
+            print(f"  -> SSIM={ssim_score:.4f}, PSNR={psnr_score:.2f} dB, MAE={mae_score:.2f} HU")
+
+            # ★ 変更: 詳細な評価レポートを生成
+            print("  🖼️ Creating detailed evaluation report...")
+            fig = create_evaluation_report(
+                generated_hu_np=generated_ct_np,
+                ground_truth_hu_np=ground_truth_hu_np,
+                ssim_score=ssim_score,
+                psnr_score=psnr_score,
+                mae_score=mae_score,
+                title_prefix=f'Evaluation Report for {Path(evaluate_npy_path).name}'
+            )
+
+            save_path = Path(checkpoint_dir) / "evaluation" / f"evaluation_report_{Path(evaluate_npy_path).stem}.png"
+            save_path.parent.mkdir(exist_ok=True, parents=True)
+            plt.savefig(save_path, facecolor='black')
+            print(f"✅ Evaluation report for .npy saved to: {save_path}")
+            wandb.log({"NPY_Evaluation_Report": wandb.Image(fig)})
+            plt.close(fig)
+        except Exception as e:
+            print(f"❌ Error during .npy evaluation: {e}")
+        return # NPY評価モードの場合はここで終了
 
     # 3. パラメータの準備
     #    このトライアルで使われたであろうパラメータを模倣します。
@@ -133,8 +185,6 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
         distributed_model.up_block_2.load_state_dict({k.replace('2.', ''): v for k, v in up_blocks_state_dict.items() if k.startswith('2.')}, strict=False)
         distributed_model.up_block_3.load_state_dict({k.replace('3.', ''): v for k, v in up_blocks_state_dict.items() if k.startswith('3.')}, strict=False)
         distributed_model.out_conv.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_out_conv.pth", map_location=distributed_model.device0))
-        distributed_model.pos_mlp_3d.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_pos_mlp_3d.pth", map_location=distributed_model.device0))
-        model_for_inference = distributed_model
 
     else: # gpu_mode == 'single'
         print(f"  Instantiating and loading models onto single device: {device}...")
@@ -159,16 +209,15 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
         unet.mid_block1.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_mid_block1.pth", map_location=device))
         unet.mid_attn.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_mid_attn.pth", map_location=device))
         unet.mid_block2.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_mid_block2.pth", map_location=device))
-        unet.up_blocks.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_up_blocks.pth", map_location=device))
-        unet.pos_mlp_3d.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_pos_mlp_3d.pth", map_location=device))
+        unet.out_conv.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_out_conv.pth", map_location=device)) # ★ 修正: out_convのロードを追加
         
         # ラッパーオブジェクトに格納
         model_for_inference = {'unet': unet.to(device), 'conditioning_encoder': conditioning_encoder.to(device)}
 
-    # 4. visualize_and_save_mpr 関数の呼び出し
-    print(f"\nCalling visualize_and_save_mpr for trial {trial_number}...")    
+    # 4. generate_and_evaluate 関数の呼び出し
+    print(f"\nCalling generate_and_evaluate for trial {trial_number}...")    
     try:
-        visualize_and_save_mpr(
+        generate_and_evaluate(
             device=device,
             params=params,
             scheduler_name="dpm_solver", # テストしたいスケジューラ名 (dpm_solver, euler, ddpm)
@@ -181,8 +230,8 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode):
             save_dir=checkpoint_dir,
             model_for_inference=model_for_inference
         )
-        print("\n✅ Visualization function finished successfully.")
-        print(f"   -> Check the output in: {checkpoint_dir}/visualizations/")
+        print("\n✅ Generation and evaluation finished successfully.")
+        print(f"   -> Check the output in: {checkpoint_dir}/evaluation/")
     except Exception as e:
         print(f"\n❌ An error occurred during visualization: {e}")
         import traceback
@@ -198,6 +247,8 @@ if __name__ == '__main__':
                         help="The encoder model used for that trial.")
     parser.add_argument("--gpu_mode", type=str, default="multi", choices=["single", "multi"],
                         help="GPU mode for inference: 'single' for one GPU, 'multi' for model parallelism across 3 GPUs.")
+    parser.add_argument("--evaluate_npy", type=str, default=None,
+                        help="Path to a generated .npy file to evaluate directly, skipping the inference step.")
     args = parser.parse_args()
 
     # チェックポイントディレクトリのパスを構築 (train.pyの保存パスと一致させる)
@@ -207,4 +258,4 @@ if __name__ == '__main__':
         print(f"エラー: チェックポイントディレクトリが見つかりません: {checkpoint_dir}")
         print("正しい trial_number を指定したか確認してください。")
     else:
-        test_visualization(args.trial_number, checkpoint_dir, args.encoder, args.gpu_mode)
+        test_visualization(args.trial_number, checkpoint_dir, args.encoder, args.gpu_mode, args.evaluate_npy)

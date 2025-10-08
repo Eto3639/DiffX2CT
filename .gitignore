@@ -16,3 +16,5 @@ run_visualization.sh
 # Pythonのコンパイル済みファイル
 __pycache__/
 *.pyc
+DiffX2CT/custom_monai/__pycache__
+DiffX2CT/custom_models/__pycache__
