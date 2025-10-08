@@ -18,3 +18,5 @@ __pycache__/
 *.pyc
 DiffX2CT/custom_monai/__pycache__
 DiffX2CT/custom_models/__pycache__
+
+/verified_paths.json
