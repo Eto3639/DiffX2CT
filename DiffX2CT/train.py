@@ -57,7 +57,7 @@ def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
             # ★ 変更点: 分散モデルで推論
             context = distributed_model.conditioning_encoder(drr1, drr2)
             predicted_noise = distributed_model(x=noisy_ct, timesteps=timesteps, context=context, pos_3d=pos_3d)
-            loss = F.l1_loss(predicted_noise, noise)
+            loss = F.mse_loss(predicted_noise, noise)
             val_loss_epoch.append(loss.item())
     # モデルの重みを元に戻す
     distributed_model.ema.restore()

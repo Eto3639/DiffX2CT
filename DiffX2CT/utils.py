@@ -4,10 +4,12 @@ import random
 import numpy as np
 import torch
 import yaml
+import os
 
-def load_config(config_path="/workspace/config.yml"):
+def load_config():
     """YAML設定ファイルを読み込む"""
-    with open(config_path, 'r') as f:
+    config_file_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "config.yml"))
+    with open(config_file_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
