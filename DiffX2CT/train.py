@@ -13,15 +13,12 @@ import matplotlib.pyplot as plt
 import wandb
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from diffusers import DDPMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler
-from custom_monai.inferer import SlidingWindowInferer # ★ 変更点: カスタムInfererをインポート
+from diffusers import DDPMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler # noqa: E501
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from safetensors.torch import load_file
 from functools import partial
 import torch
 
 # --- リファクタリングによるインポートの変更 ---
-from skimage.metrics import peak_signal_noise_ratio as psnr # ★ 追加: PSNR計算のため
 from utils import load_config, set_seed
 from data_utils import Preprocessed_CT_DRR_Dataset, GridPatchDatasetWithCond
 from models import DistributedUNet
@@ -32,271 +29,19 @@ from custom_models.conditioning_encoder import (
 )
 from custom_models.unet import DiffusionModelUNet
 from torch.utils.checkpoint import checkpoint
-from torch.cuda.amp import GradScaler, autocast # ★ 高速化: 混合精度学習のためにインポート
+
+# --- ★ 追加: 分離したユーティリティ関数をインポート ---
+from evaluation_utils import (
+    EMA,
+    calculate_mae,
+    generate_and_evaluate,
+    create_evaluation_report
+)
 
 CONFIG = load_config()
 
-class EMA:
-    """
-    モデルパラメータの指数移動平均を管理するクラス。
-    """
-    def __init__(self, model, decay):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-
-        self.register()
-
-    def register(self):
-        """モデルのパラメータをシャドウパラメータとして登録する。"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        """現在のモデルの重みを使ってシャドウパラメータを更新する。"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        """推論のために、現在のモデルの重みをシャドウパラメータに置き換える。"""
-        self.backup = {}
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
-
-    def restore(self):
-        """バックアップしておいた元のモデルの重みに戻す。"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
-
-    def state_dict(self):
-        return self.shadow
-
-    def load_state_dict(self, state_dict):
-        self.shadow = state_dict
-
-def calculate_mae(image_true, image_test):
-    """平均絶対誤差 (MAE) を計算する"""
-    return np.mean(np.abs(image_true - image_test))
 
 
-# --- ★ 変更点: accelerator を使わない可視化関数 ---
-def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, pos_3d, best_epoch, trial_number, save_dir, model_for_inference):
-    print(f"--- Starting Generation & Evaluation on device: {device} ---")
-
-    vis_dir = Path(save_dir) / "evaluation" # 保存先ディレクトリ名を変更
-    vis_dir.mkdir(exist_ok=True, parents=True)
-
-    # 1. モデルを評価モードに設定
-    is_distributed = isinstance(model_for_inference, DistributedUNet)
-    if is_distributed:
-        model_for_inference.eval()
-        print("  [Visualization] Using provided DistributedUNet model.")
-    else: # single GPU mode (visualization.py用)
-        model_for_inference['unet'].eval()
-        model_for_inference['conditioning_encoder'].eval()
-        print("  [Visualization] Using provided single-GPU models.")
-
-    # EMAモデルの重みを適用
-    if 'ema' in model_for_inference:
-        model_for_inference['ema'].apply_shadow()
-    
-    # 3. スケジューラを選択
-    if scheduler_name == "dpm_solver":
-        scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000)
-    elif scheduler_name == "euler":
-        scheduler = EulerDiscreteScheduler(num_train_timesteps=1000)
-    else: # ddpm
-        scheduler = DDPMScheduler(num_train_timesteps=1000)
-
-    # 4. 推論の準備
-    ct_full, drr1, drr2, pos_3d = ct_full.to(device), drr1.to(device), drr2.to(device), pos_3d.to(device)
-    
-    # ★ 変更点: SlidingWindowInfererを使用してフルボリュームを推論
-    patch_size = (params['patch_size'], params['patch_size'], params['patch_size'])
-    inferer = SlidingWindowInferer(
-        roi_size=patch_size, 
-        sw_batch_size=1, 
-        overlap=params.get('patch_overlap', 0.5), # configからoverlapを取得
-        mode=params.get('blend_mode', 'cosine')) # configからblend_modeを取得
-
-    # 5. 推論を実行
-    with torch.no_grad(), autocast(enabled=False): # 推論時は混合精度をオフ
-        initial_noise = torch.randn_like(ct_full)
-        scheduler.set_timesteps(num_inference_steps=50)
-        image = initial_noise
-
-        for t in tqdm(scheduler.timesteps, desc=f"🖼️ Visualizing Trial {trial_number} (Full Volume)"):
-            timesteps_tensor = torch.tensor((t,), device=image.device).long().repeat(image.shape[0])
-            
-            if is_distributed:
-                # 分散モデル用の推論関数
-                context = model_for_inference.conditioning_encoder(drr1, drr2)
-                model_func = lambda x: model_for_inference(x=x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
-                model_output = inferer(inputs=image, network=model_func)
-            else:
-                # 単一GPUモデル用の推論関数
-                context = model_for_inference['conditioning_encoder'](drr1, drr2)
-                model_func = lambda x: model_for_inference['unet'](x, timesteps=timesteps_tensor, context=context, pos_3d=pos_3d)
-                model_output = inferer(inputs=image, network=model_func)
-            
-            image = scheduler.step(model_output, t, image).prev_sample
-
-    # EMAモデルの重みを元に戻す
-    if 'ema' in model_for_inference:
-        model_for_inference['ema'].restore()
-
-    # 6. 結果をHU値に逆正規化
-    # 6a. 推論結果を正規化範囲 [0, 1] にクリッピング
-    #     拡散モデルの出力は範囲外の値を取りうるため、クリッピングが不可欠
-    image = torch.clamp(image, 0, 1)
-    ct_full = torch.clamp(ct_full, 0, 1)
-
-    print("  De-normalizing images to HU range...")
-    # ターゲットのHU範囲
-    min_hu = -1024
-    max_hu = 1500
-
-    # 6b. [0, 1] の範囲から [min_hu, max_hu] の範囲にスケール変換
-    generated_hu_np = image.squeeze().cpu().numpy() * (max_hu - min_hu) + min_hu
-    ground_truth_hu_np = ct_full.squeeze().cpu().numpy() * (max_hu - min_hu) + min_hu
-
-    # 生成されたCTボリュームをNumPy配列として保存
-    save_npy_path = vis_dir / f"generated_ct_trial_{trial_number}_epoch_{best_epoch}_HU.npy"
-    np.save(save_npy_path, generated_hu_np)
-    print(f"  💾 Generated CT volume saved as numpy array: {save_npy_path}")
-
-    # 7. 品質評価指標を計算
-    print("  📊 Calculating quality metrics...")
-    data_range = max_hu - min_hu # 評価範囲を固定
-    ssim_score = StructuralSimilarityIndexMeasure(data_range=data_range)(torch.from_numpy(generated_hu_np).unsqueeze(0).unsqueeze(0), torch.from_numpy(ground_truth_hu_np).unsqueeze(0).unsqueeze(0)).item()
-    psnr_score = psnr(ground_truth_hu_np, generated_hu_np, data_range=data_range)
-    mae_score = calculate_mae(ground_truth_hu_np, generated_hu_np)
-    print(f"  -> SSIM={ssim_score:.4f}, PSNR={psnr_score:.2f} dB, MAE={mae_score:.2f} HU")
-
-    # 9. 評価レポートを生成
-    print("  🖼️ Creating evaluation report...")
-    fig = create_evaluation_report(
-        generated_hu_np=generated_hu_np,
-        ground_truth_hu_np=ground_truth_hu_np,
-        ssim_score=ssim_score,
-        psnr_score=psnr_score,
-        mae_score=mae_score,
-        title_prefix=f'Evaluation Report for Trial {trial_number} (Epoch {best_epoch})'
-    )
-    
-    save_path = vis_dir / f"evaluation_report_trial_{trial_number}_epoch_{best_epoch}.png"
-    plt.savefig(save_path, facecolor='black')
-    wandb.log({"Evaluation_Report": wandb.Image(fig)}, step=CONFIG["EPOCHS"])
-    plt.close(fig)
-    print(f"  ✅ Evaluation report saved to: {save_path}")
-
-
-def create_evaluation_report(generated_hu_np, ground_truth_hu_np, ssim_score, psnr_score, mae_score, title_prefix):
-    """
-    生成されたCTと正解CTを比較する詳細な評価レポート（画像）を生成します。
-
-    Args:
-        generated_hu_np (np.ndarray): 生成されたCTボリューム（HU値）
-        ground_truth_hu_np (np.ndarray): 正解のCTボリューム（HU値）
-        ssim_score (float): SSIMスコア
-        psnr_score (float): PSNRスコア
-        mae_score (float): MAEスコア
-        title_prefix (str): 図のタイトルのプレフィックス
-
-    Returns:
-        matplotlib.figure.Figure: 生成されたレポートのFigureオブジェクト
-    """
-    # 統計情報を計算 (空気以外)
-    non_air_voxels_gen = generated_hu_np[generated_hu_np > -1000]
-    stats_gen = {
-        'mean': np.mean(non_air_voxels_gen), 'std': np.std(non_air_voxels_gen),
-        'min': np.min(non_air_voxels_gen), 'max': np.max(non_air_voxels_gen)
-    } if non_air_voxels_gen.size > 0 else {}
-
-    non_air_voxels_gt = ground_truth_hu_np[ground_truth_hu_np > -1000]
-    stats_gt = {
-        'mean': np.mean(non_air_voxels_gt), 'std': np.std(non_air_voxels_gt),
-        'min': np.min(non_air_voxels_gt), 'max': np.max(non_air_voxels_gt)
-    } if non_air_voxels_gt.size > 0 else {}
-
-    fig = plt.figure(figsize=(20, 14), facecolor='black')
-    gs = plt.GridSpec(3, 4, figure=fig)
-    
-    z, y, x = ground_truth_hu_np.shape
-    slice_ax, slice_cor, slice_sag = z // 2, y // 2, x // 2
-    vmin, vmax = -1024, 300 # 表示ウィンドウ
-
-    views = {
-        'Axial': (ground_truth_hu_np[slice_ax, :, :], generated_hu_np[slice_ax, :, :], gs[0, 0], gs[0, 1]),
-        'Coronal': (np.flipud(ground_truth_hu_np[:, slice_cor, :]), np.flipud(generated_hu_np[:, slice_cor, :]), gs[1, 0], gs[1, 1]),
-        'Sagittal': (np.fliplr(np.flipud(ground_truth_hu_np[:, :, slice_sag])), np.fliplr(np.flipud(generated_hu_np[:, :, slice_sag])), gs[2, 0], gs[2, 1])
-    }
-
-    for title, (gt_img, gen_img, gs_gt, gs_gen) in views.items():
-        ax_gt = fig.add_subplot(gs_gt)
-        ax_gt.imshow(gt_img, cmap='gray', vmin=vmin, vmax=vmax)
-        ax_gt.set_title(f'Ground Truth {title}', color='cyan')
-        ax_gt.axis('off')
-
-        ax_gen = fig.add_subplot(gs_gen)
-        ax_gen.imshow(gen_img, cmap='gray', vmin=vmin, vmax=vmax)
-        ax_gen.set_title(f'Generated {title}', color='magenta')
-        ax_gen.axis('off')
-
-    # 8. 統計情報を計算 (空気以外)
-    print("  ⏳ Calculating statistics (excluding air)...")
-    non_air_voxels_gen = generated_hu_np[generated_hu_np > -1000]
-    stats_gen = {
-        'mean': np.mean(non_air_voxels_gen), 'std': np.std(non_air_voxels_gen),
-        'min': np.min(non_air_voxels_gen), 'max': np.max(non_air_voxels_gen)
-    } if non_air_voxels_gen.size > 0 else {}
-
-    non_air_voxels_gt = ground_truth_hu_np[ground_truth_hu_np > -1000]
-    stats_gt = {
-        'mean': np.mean(non_air_voxels_gt), 'std': np.std(non_air_voxels_gt),
-        'min': np.min(non_air_voxels_gt), 'max': np.max(non_air_voxels_gt)
-    } if non_air_voxels_gt.size > 0 else {}
-
-    # ヒストグラム
-    ax_hist_gt = fig.add_subplot(gs[0, 2]); ax_hist_gen = fig.add_subplot(gs[0, 3])
-    if stats_gt: ax_hist_gt.hist(non_air_voxels_gt.flatten(), bins=100, color='deepskyblue')
-    ax_hist_gt.set_title("Ground Truth - HU Histogram", color='cyan'); ax_hist_gt.set_facecolor('darkgray'); ax_hist_gt.tick_params(colors='white')
-    if stats_gen: ax_hist_gen.hist(non_air_voxels_gen.flatten(), bins=100, color='orchid')
-    ax_hist_gen.set_title("Generated - HU Histogram", color='magenta'); ax_hist_gen.set_facecolor('darkgray'); ax_hist_gen.tick_params(colors='white')
-
-    # 統計情報とスコア
-    ax_text = fig.add_subplot(gs[1:, 2:]); ax_text.axis('off')
-    report_text = (
-        f"--- Quality Metrics ---\n"
-        f"  SSIM: {ssim_score:.4f}\n"
-        f"  PSNR: {psnr_score:.2f} dB\n"
-        f"  MAE:  {mae_score:.2f} HU\n\n"
-        f"--- Statistics (HU, > -1000) ---\n"
-        f"  [Ground Truth]\n"
-        f"    Mean / Std: {stats_gt.get('mean', 0):.2f} / {stats_gt.get('std', 0):.2f}\n"
-        f"    Min / Max:  {stats_gt.get('min', 0):.0f} / {stats_gt.get('max', 0):.0f}\n\n"
-        f"  [Generated]\n"
-        f"    Mean / Std: {stats_gen.get('mean', 0):.2f} / {stats_gen.get('std', 0):.2f}\n"
-        f"    Min / Max:  {stats_gen.get('min', 0):.0f} / {stats_gen.get('max', 0):.0f}\n"
-    )
-    ax_text.text(0.05, 0.7, report_text, color='white', fontfamily='monospace', fontsize=14, va='top')
-
-    fig.suptitle(title_prefix, color='white', fontsize=20)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    return fig
-
-
-# --- ★ 変更点: accelerator を使わない評価関数 ---
 def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
     # 評価時はEMAの重みを使用する
     distributed_model.ema.apply_shadow()
@@ -323,8 +68,12 @@ def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
 def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint=None): # noqa: E501
     start_epoch = 0 # ★ 変更: 開始エポックを定義
     wandb_run_id = None # ★ 追加: WandB再開用のID
-    BATCH_SIZE = CONFIG["BATCH_SIZE"]
-    patch_size_val = params["patch_size"] # configから直接渡される
+    BATCH_SIZE = CONFIG["BATCH_SIZE"]    
+    # --- ★ 変更: configからパッチサイズとボリュームサイズを直接読み込む ---
+    # これにより、サイズ関連の設定がconfig.ymlに集約されていることが明確になります。
+    patch_size_val = CONFIG["TRAINING"]["PATCH_SIZE"]
+    target_volume_size = CONFIG["DATA"]["TARGET_VOLUME_SIZE"]
+
     PATCH_SIZE = (patch_size_val, patch_size_val, patch_size_val)
     lr = params["learning_rate"]
     weight_decay = params["weight_decay"]
@@ -332,6 +81,11 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
 
     SAVE_PATH = f"./checkpoints/trial_{trial_number}"
     os.makedirs(SAVE_PATH, exist_ok=True)
+
+    # --- ★ 追加: パッチサイズとボリュームサイズの検証 ---
+    for i in range(3):
+        if PATCH_SIZE[i] > target_volume_size[i]:
+            raise ValueError(f"設定エラー: PATCH_SIZE[{i}] ({PATCH_SIZE[i]}) が TARGET_VOLUME_SIZE[{i}] ({target_volume_size[i]}) を超えています。config.ymlを確認してください。")
 
     # --- ★ 変更点: モデル並列用のデバイス設定 ---
     if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
@@ -383,7 +137,8 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     # 注意: torch.compileはカスタムのforwardを持つモデルやcheckpointと競合する可能性があるため、まずはコメントアウト。
     # 動作しない場合は、この行を無効にしてください。
     model_params = list(distributed_model.parameters())
-    optimizer = torch.optim.AdamW(model_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+    # --- ★ 変更: AMP安定化のため、epsを調整 ---
+    optimizer = torch.optim.AdamW(model_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95), eps=1e-6)
 
     # --- ★ 変更点: スケジューラをconfigに基づいて設定 ---
     scheduler_name = params.get('scheduler_name', 'linear')
@@ -393,7 +148,8 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
         beta_schedule = "linear"
     scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=beta_schedule)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    # scaler = GradScaler() # ★ 変更: 混合精度を無効化
+    # --- ★ 変更: 混合精度(AMP)を再度有効化 ---
+    scaler = torch.cuda.amp.GradScaler()
 
     if resume_from_checkpoint:
         checkpoint_path = Path(resume_from_checkpoint)
@@ -426,7 +182,8 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
         ema_checkpoint_path = checkpoint_path / "ema_model.pth"
         if ema_checkpoint_path.exists():
             ema_model.load_state_dict(torch.load(ema_checkpoint_path, map_location=device))
-        # scaler.load_state_dict(torch.load(Path(resume_from_checkpoint) / "scaler.pth")) # ★ 変更: 混合精度を無効化
+        # --- ★ 変更: scalerの状態もロード ---
+        scaler.load_state_dict(torch.load(Path(resume_from_checkpoint) / "scaler.pth"))
 
         # ★ 変更: エポック数とbest_val_lossをロード
         info_path = checkpoint_path / "checkpoint_info.json"
@@ -470,6 +227,11 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     # torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(start_epoch, CONFIG["EPOCHS"]):
+        # --- ★ 追加: 可視化用のデータを準備 ---
+        # vis_dataloaderはshuffle=Falseなので、常に同じ検証データで可視化が行われる
+        # これにより、エポック間の比較が容易になる
+        fixed_vis_data = next(iter(vis_dataloader))
+
         distributed_model.train()
         # --- ★ 変更: L2損失に一時的に固定 ---
         # # 元のコード: 現在のエポックに基づいて損失タイプを決定
@@ -490,10 +252,10 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (ct_patch.shape[0],), device=ct_patch.device).long()
             noisy_ct = scheduler.add_noise(original_samples=ct_patch, noise=noise, timesteps=timesteps)
 
-            # ★ 変更: autocastを無効化し、float32で計算
-            # with autocast():
-            context = distributed_model.conditioning_encoder(drr1, drr2)
-            predicted_noise = checkpoint(distributed_model, noisy_ct, timesteps, context, pos_3d, use_reentrant=False)
+            # --- ★ 変更: autocastを有効化 ---
+            with torch.cuda.amp.autocast():
+                context = distributed_model.conditioning_encoder(drr1, drr2)
+                predicted_noise = checkpoint(distributed_model, noisy_ct, timesteps, context, pos_3d, use_reentrant=False)
 
             # --- ★ 変更: L2損失に一時的に固定 ---
             loss = F.mse_loss(predicted_noise, noise)
@@ -514,28 +276,26 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\n🔥 NaN or Inf loss detected at epoch {epoch+1}, step {step}. Aborting trial.")
                 return float('inf')
-
-            # ★ 変更: scalerを使わずに勾配を計算
-            loss.backward()
-            # scaler.scale(loss).backward()
+            
+            # --- ★ 変更: scalerを使って勾配を計算 ---
+            scaler.scale(loss).backward()
 
             train_loss_epoch += loss.item() * gradient_accumulation_steps # スケールを元に戻して加算
 
             # 勾配蓄積ステップに達したらパラメータを更新
             if (step + 1) % gradient_accumulation_steps == 0:
-                # ★ 変更: scaler関連の処理をコメントアウト
-                # scaler.unscale_(optimizer)
+                # --- ★ 変更: 勾配クリッピングをunscale後に行う ---
+                # 1. 勾配をunscaleする
+                scaler.unscale_(optimizer)
                 
-                # --- ★ 変更: 勾配クリッピングをより強力にする ---
-                # ノルム(L2ノルム)でのクリッピングに加えて、値自体もクリッピングする
-                torch.nn.utils.clip_grad_value_(model_params, clip_value=1.0)
+                # 2. 勾配をクリッピングする (inf/nanチェックも兼ねる)
                 torch.nn.utils.clip_grad_norm_(model_params, CONFIG["MAX_GRAD_NORM"])
 
-                # ★ 変更: scalerを使わずにoptimizerを更新
-                optimizer.step()
-                # scaler.step(optimizer)
-                # scaler.update()
-                # --- ★ 追加: EMAの更新 ---
+                # 3. optimizerを更新 (scalerがinf/nanを検知したらスキップする)
+                scaler.step(optimizer)
+                
+                # 4. scalerを更新
+                scaler.update()
                 ema_model.update()
                 optimizer.zero_grad()
         
@@ -564,7 +324,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             torch.save(distributed_model.out_conv.state_dict(), Path(SAVE_PATH) / "unet_out_conv.pth")
             torch.save(ema_model.state_dict(), Path(SAVE_PATH) / "ema_model.pth") # ★ 追加: EMAの重みを保存
             torch.save(optimizer.state_dict(), Path(SAVE_PATH) / "optimizer.pth")
-            # torch.save(scaler.state_dict(), Path(SAVE_PATH) / "scaler.pth") # ★ 変更: 混合精度を無効化
+            torch.save(scaler.state_dict(), Path(SAVE_PATH) / "scaler.pth") # ★ 変更: 混合精度を有効化
 
             # ★ 変更: エポック数と検証ロスを保存
             checkpoint_info = {
@@ -574,6 +334,29 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             }
             with open(Path(SAVE_PATH) / "checkpoint_info.json", 'w') as f:
                 json.dump(checkpoint_info, f, indent=4)
+
+        # --- ★ 追加: 定期的な可視化プロセス ---
+        visualization_freq = CONFIG["TRAINING"].get("VISUALIZATION_FREQ", 0)
+        # visualization_freqが0より大きい場合、その頻度で実行
+        # または、最終エポックの場合に実行
+        if (visualization_freq > 0 and (epoch + 1) % visualization_freq == 0) or ((epoch + 1) == CONFIG["EPOCHS"]):
+            print(f"--- 🖼️ Running visualization for epoch {epoch + 1} ---")
+            try:
+                vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d = fixed_vis_data
+                generate_and_evaluate(
+                    device,
+                    {"encoder": encoder_name, **params},
+                    "dpm_solver", # 可視化には高速なスケジューラを使用
+                    vis_ct_full,
+                    vis_drr1,
+                    vis_drr2,
+                    vis_pos_3d,
+                    epoch + 1, # 現在のエポック番号を渡す
+                    trial_number, SAVE_PATH,
+                    model_for_inference=distributed_model
+                )
+            except Exception as e:
+                print(f"❌ An error occurred during periodic visualization at epoch {epoch + 1}: {e}")
     
     
     if best_epoch != -1:
@@ -592,7 +375,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 vis_pos_3d,
                 best_epoch, 
                 trial_number, SAVE_PATH,
-                model_for_inference={'unet': distributed_model, 'ema': ema_model} # 学習済み分散モデルとEMAを渡す
+                model_for_inference=distributed_model # ★ 修正: 辞書ではなく、DistributedUNetインスタンスを直接渡す
             )
         except Exception as e:
             print(f"An error occurred during final visualization: {e}")
@@ -649,6 +432,19 @@ def main(args):
         with open(cache_file, 'w') as f:
             json.dump({'train': [str(p) for p in train_paths], 'val': [str(p) for p in val_paths]}, f, indent=4)
         print(f"💾 Saved verified paths to cache file: {cache_file}")
+
+    # --- ★ 追加: config.ymlのDATA_RATIOに基づいてデータセットを削減 ---
+    data_ratio = CONFIG["DATA"]["DATA_RATIO"]
+    if data_ratio < 1.0:
+        print(f"⚠️ Using only {data_ratio * 100:.1f}% of the dataset for training and validation based on DATA_RATIO in config.")
+        
+        num_train = int(len(train_paths) * data_ratio)
+        num_val = int(len(val_paths) * data_ratio)
+        
+        train_paths = train_paths[:num_train]
+        val_paths = val_paths[:num_val]
+        
+        print(f"  -> Reduced to {len(train_paths)} training samples and {len(val_paths)} validation samples.")
 
     # Optuna学習ループ
     # config.ymlから設定を読み込む

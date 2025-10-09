@@ -11,17 +11,20 @@ import numpy as np
 # train.pyから必要なコンポーネントをインポートします
 # このスクリプトはtrain.pyと同じディレクトリに配置してください
 try:
+    # --- ★ 変更: train.py と evaluation_utils.py からインポート ---
     from train import (
-        generate_and_evaluate,
         Preprocessed_CT_DRR_Dataset,
         CONFIG, set_seed,
         DistributedUNet,
         ConditioningEncoderResNet,
         ConditioningEncoderConvNeXt,
         ConditioningEncoderEfficientNetV2,
-        DiffusionModelUNet,
-        psnr, # ★ 修正: psnr関数をインポート
-        create_evaluation_report # ★ 追加: レポート生成関数をインポート
+        DiffusionModelUNet
+    )
+    from evaluation_utils import (
+        generate_and_evaluate,
+        create_evaluation_report,
+        calculate_mae
     )
 except ImportError as e:
     print("エラー: train.pyからのインポートに失敗しました。")
@@ -102,9 +105,10 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode, eva
             ground_truth_hu_np = ct_full.squeeze().cpu().numpy() * (max_hu - min_hu) + min_hu
 
             # 評価レポートを生成 (train.pyのgenerate_and_evaluateから一部を抜粋・改造)
-            from train import calculate_mae
             from torchmetrics.image import StructuralSimilarityIndexMeasure
             import matplotlib.pyplot as plt
+            # --- ★ 修正: psnr関数を使用する前にインポート ---
+            from skimage.metrics import peak_signal_noise_ratio as psnr
 
             print("  📊 Calculating quality metrics...")
             data_range = max_hu - min_hu
@@ -185,6 +189,7 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode, eva
         distributed_model.up_block_2.load_state_dict({k.replace('2.', ''): v for k, v in up_blocks_state_dict.items() if k.startswith('2.')}, strict=False)
         distributed_model.up_block_3.load_state_dict({k.replace('3.', ''): v for k, v in up_blocks_state_dict.items() if k.startswith('3.')}, strict=False)
         distributed_model.out_conv.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_out_conv.pth", map_location=distributed_model.device0))
+        model_for_inference = distributed_model # ★ 修正: ロードした分散モデルを推論用モデルとして設定
 
     else: # gpu_mode == 'single'
         print(f"  Instantiating and loading models onto single device: {device}...")

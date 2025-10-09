@@ -1,5 +1,5 @@
 SEED: 42
-PROJECT_NAME: "3D-CT-Diffusion-Unet-patch128"
+PROJECT_NAME: "3D-CT-Diffusion-Unet-validation-visualize"
 EPOCHS: 30
 BATCH_SIZE: 1
 VALIDATION_SPLIT: 0.2
@@ -9,19 +9,26 @@ NUM_WORKERS: 8
 DATA:
   PT_DATA_DIR: "/workspace/data/LIDC/dataset_256/CT_pt"
   DRR_DIR: "/workspace/data/LIDC/dataset_256/DRR_mod"
+  DATA_RATIO: 0.4
+  # ★ 追加: データセットのターゲットサイズを定義
+  # CTボリュームのサイズ (Depth, Height, Width)
+  TARGET_VOLUME_SIZE: [256, 256, 256]
+  # DRR画像のサイズ (Height, Width)
+  TARGET_DRR_SIZE: [256, 256]
 
 TRAINING:
   ENCODER: "convnext"  # 使用するエンコーダー (resnet, convnext, efficientnet)
-  PATCH_SIZE: 128 # ★ 変更点: パッチサイズを128から160に増加
+  PATCH_SIZE: 128 # パッチサイズ (TARGET_VOLUME_SIZEより小さい必要があります)
   LOSS_PHASE_EPOCHS: [10, 20] # 損失関数を切り替えるエポック
   L1_SSIM_RATIO: 0.5 # L1損失とSSIM損失の割合 (L1 * ratio + SSIM * (1-ratio))
   # --- Optunaから移動したハイパーパラメータ ---
   LEARNING_RATE: 0.0002
   WEIGHT_DECAY: 0.01
   GRADIENT_ACCUMULATION_STEPS: 8
-  patch_overlap: 0.5 # パッチのオーバーラップ率 (0.0 ~ 1.0)
+  patch_overlap: 0.25 # パッチのオーバーラップ率 (0.0 ~ 1.0)
   blend_mode: 'cosine' # 推論時のブレンディングモード ('constant', 'gaussian', 'cosine')
   scheduler_name: 'cosine' # スケジューラの種類 ('linear', 'cosine')
+  VISUALIZATION_FREQ: 10 # エポックごとに可視化を行う頻度
 
 OPTUNA:
   N_TRIALS: 20 # Optunaの試行回数

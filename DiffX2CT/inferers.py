@@ -29,7 +29,7 @@ class SlidingWindowInferer:
         sigma_scale: Sequence[float] | float = 0.125,
         padding_mode: str = "constant",
         cval: float = 0.0,
-        sw_device: torch.device | str = "cuda",  # ★ 修正: デフォルトをcudaに
+        sw_device: torch.device | str = "cuda",
         device: torch.device | str | None = None,
         progress: bool = False,
         cache_roi_weight_map: bool = False,
@@ -49,17 +49,18 @@ class SlidingWindowInferer:
         self.cache_roi_weight_map = cache_roi_weight_map 
 
     def __call__(self, inputs: torch.Tensor, network: Callable[..., torch.Tensor], *args, **kwargs) -> torch.Tensor:
-        device = self.device
+        device = kwargs.get("device", self.device)
         if device is None and isinstance(inputs, torch.Tensor):
             device = inputs.device
         if device is None:
-            device = torch.device("cuda")  # ★ 修正: デフォルトをcudaに
+            device = torch.device("cuda")
         
-        # ★ 修正: sw_deviceが文字列の場合の処理を追加
         if isinstance(self.sw_device, str):
             sw_device = torch.device(self.sw_device)
         else:
             sw_device = self.sw_device
+
+        pos_3d_full = kwargs.get("pos_3d", None)
 
         num_spatial_dims = len(inputs.shape) - 2
         
@@ -86,7 +87,7 @@ class SlidingWindowInferer:
                 warnings.warn("tqdm is not installed, disabling progress bar.")
 
         if self.mode == "gaussian":
-            importance_map = _compute_importance_map(roi_size, self.sigma_scale, device)  # ★ 修正: deviceを使用
+            importance_map = _compute_importance_map(roi_size, self.sigma_scale, device)
         else:
             importance_map = None
 
@@ -104,7 +105,7 @@ class SlidingWindowInferer:
 
         scan_strides: list[torch.Tensor] = []
         for i in range(num_spatial_dims):
-            stride_range = torch.arange(scan_num[i], dtype=torch.long, device=device)  # ★ 修正: deviceを使用
+            stride_range = torch.arange(scan_num[i], dtype=torch.long, device=device)
             scan_strides.append(stride_range)
 
         scan_strides_prod = torch.stack(torch.meshgrid(scan_strides, indexing="ij"), dim=-1).view(-1, num_spatial_dims)
@@ -115,42 +116,45 @@ class SlidingWindowInferer:
         for slice_g in range(0, len(scan_strides_prod), self.sw_batch_size):
             slice_range = range(slice_g, min(slice_g + self.sw_batch_size, len(scan_strides_prod)))
             untrimmed_box_starts = scan_strides_prod[slice_range]
-            untrimmed_box_ends = untrimmed_box_starts + torch.as_tensor(roi_size, device=device)  # ★ 修正: deviceを使用
+            untrimmed_box_ends = untrimmed_box_starts + torch.as_tensor(roi_size, device=device)
             
             trim_s = torch.max(untrimmed_box_starts, torch.zeros_like(untrimmed_box_starts)).long()
             trim_e = torch.min(untrimmed_box_ends, torch.as_tensor(inputs.shape[2:], device=device)).long()
 
-            # バッチデータを構築
             batch_data = []
             for i in range(len(trim_s)):
-                # 各ROIのスライスを作成
                 spatial_slices = []
                 for dim in range(num_spatial_dims):
                     start = trim_s[i][dim].item()
                     end = trim_e[i][dim].item()
                     spatial_slices.append(slice(start, end))
                 
-                # 入力からROIを抽出 [C, D, H, W] の形で
                 roi = inputs[0, :, spatial_slices[0], spatial_slices[1], spatial_slices[2]]
+
+                # ★ 変更: モデルに渡す引数用の辞書をコピーして作成
+                network_kwargs = kwargs.copy()
+                if pos_3d_full is not None:
+                    pos_d = pos_3d_full[0][spatial_slices[0]]
+                    pos_h = pos_3d_full[1][spatial_slices[1]]
+                    pos_w = pos_3d_full[2][spatial_slices[2]]
+                    pos_3d_patch = torch.stack([pos_d, pos_h, pos_w], dim=0).unsqueeze(0)
+                    network_kwargs["pos_3d"] = pos_3d_patch.to(device)
+
                 batch_data.append(roi)
             
-            # バッチ次元でスタック [B, C, D, H, W]
             window_data = torch.stack(batch_data, dim=0)
-            # DataParallelに対応するため、モデルと同じデバイスにデータを送る
             if isinstance(network, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
                 window_data = window_data.to(device)
+            else:
+                window_data = window_data.to(device)
 
-            # ★ 修正: networkの引数に 'x' があるかチェックして呼び出しを分ける
             import inspect
             sig = inspect.signature(network.forward if isinstance(network, torch.nn.Module) else network)
             if 'x' in sig.parameters:
-                # DistributedUNetのようにキーワード引数 'x' を持つモデル
-                seg_prob = network(x=window_data) # ★ 修正: 不要なkwargsを渡さない
+                seg_prob = network(x=window_data, **network_kwargs) # ★ 変更: コピーした辞書を使用
             else:
-                # 通常のモデル (第一引数が入力テンソル)
-                seg_prob = network(window_data) # ★ 修正: 不要なkwargsを渡さない
+                seg_prob = network(window_data, **network_kwargs) # ★ 変更: コピーした辞書を使用
 
-            # ★ 修正: seg_probを適切なデバイスに移動
             if seg_prob.device != device:
                 seg_prob = seg_prob.to(device)
 
@@ -162,11 +166,9 @@ class SlidingWindowInferer:
                 _initialized = True
 
             if importance_map is not None:
-                # importance_mapをバッチサイズに合わせて拡張
-                expanded_importance_map = importance_map.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                expanded_importance_map = importance_map.unsqueeze(0).unsqueeze(0)
                 seg_prob = seg_prob * expanded_importance_map
 
-            # 出力を正しい位置に追加
             for i in range(len(trim_s)):
                 spatial_slices = []
                 for dim in range(num_spatial_dims):
@@ -174,7 +176,6 @@ class SlidingWindowInferer:
                     end = trim_e[i][dim].item()
                     spatial_slices.append(slice(start, end))
                 
-                # 出力テンソルに追加
                 output_slice = (0, slice(None)) + tuple(spatial_slices)
                 count_slice = (0, slice(None)) + tuple(spatial_slices)
                 
