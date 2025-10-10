@@ -343,9 +343,8 @@ def train_and_evaluate(params, trial, train_paths, val_paths, loss_phase_epochs,
                 wandb.summary.update({f"final_{k}": v for k, v in params.items()})
                 wandb.summary.update({f"final_loss_weight_{k}": v for k, v in CONFIG["TRAINING"]["LOSS_WEIGHTS"].items()})
                 # Optunaにこのトライアルが失敗したことを伝えるために大きな値を返す
-                # trial.report(float('inf'), step) # Optunaの枝刈り機能を使う場合
-                # wandb.finish(exit_code=1) # 終了コード1でWandBを終了
-                return float('inf')
+                wandb.finish(exit_code=1) # 終了コード1でWandBを終了
+                raise optuna.exceptions.TrialPruned()
             
             # --- ★ 変更: scalerを使って勾配を計算 ---
             scaler.scale(scaled_loss).backward()
