@@ -11,9 +11,10 @@ import json
 import argparse
 import matplotlib.pyplot as plt
 import wandb
+import gc # ★ 追加: ガベージコレクション
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from diffusers import DDPMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler # noqa: E501
+from diffusers import DDPMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from functools import partial
 import torch
@@ -42,7 +43,7 @@ CONFIG = load_config()
 
 
 
-def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
+def evaluate_epoch(device, distributed_model, scheduler, val_dataloader, trial=None, epoch=0):
     # 評価時はEMAの重みを使用する
     distributed_model.ema.apply_shadow()
     distributed_model.eval()
@@ -61,14 +62,35 @@ def evaluate_epoch(device, distributed_model, scheduler, val_dataloader):
             val_loss_epoch.append(loss.item())
     # モデルの重みを元に戻す
     distributed_model.ema.restore()
-    return np.mean(val_loss_epoch)
+    avg_val_loss = np.mean(val_loss_epoch)
+
+    # --- ★ 追加: Optunaの枝刈り(Pruning)機能 ---
+    if trial:
+        trial.report(avg_val_loss, epoch)
+
+    return avg_val_loss
 
 
 # --- 学習・評価関数 ---
-def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, resume_from_checkpoint=None): # noqa: E501
+def train_and_evaluate(params, trial, train_paths, val_paths, loss_phase_epochs, data_config, resume_from_checkpoint=None): # noqa: E501
     start_epoch = 0 # ★ 変更: 開始エポックを定義
     wandb_run_id = None # ★ 追加: WandB再開用のID
-    BATCH_SIZE = CONFIG["BATCH_SIZE"]    
+    
+    # --- ★ 変更: モデルサイズに応じてバッチサイズを動的に調整 ---
+    base_batch_size = CONFIG["BATCH_SIZE"]
+    model_scale = params["model_scale"]
+    if model_scale == "medium":
+        # パラメータ数が約2倍になると仮定し、バッチサイズを半分に
+        BATCH_SIZE = max(1, base_batch_size // 2)
+    elif model_scale == "large":
+        # パラメータ数が約4倍になると仮定し、バッチサイズを1/4に
+        BATCH_SIZE = max(1, base_batch_size // 4)
+    else: # small
+        BATCH_SIZE = base_batch_size
+    
+    print(f"ℹ️ Model scale: '{model_scale}', Base BATCH_SIZE: {base_batch_size}, Adjusted BATCH_SIZE: {BATCH_SIZE}")
+    # ---------------------------------------------------------
+
     # --- ★ 変更: configからパッチサイズとボリュームサイズを直接読み込む ---
     # これにより、サイズ関連の設定がconfig.ymlに集約されていることが明確になります。
     patch_size_val = CONFIG["TRAINING"]["PATCH_SIZE"]
@@ -79,7 +101,7 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     weight_decay = params["weight_decay"]
     gradient_accumulation_steps = params["gradient_accumulation_steps"]
 
-    SAVE_PATH = f"./checkpoints/trial_{trial_number}"
+    SAVE_PATH = f"./checkpoints/trial_{trial.number}"
     os.makedirs(SAVE_PATH, exist_ok=True)
 
     # --- ★ 追加: パッチサイズとボリュームサイズの検証 ---
@@ -110,32 +132,52 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=CONFIG["NUM_WORKERS"], pin_memory=True) # ★ 高速化: pin_memory=True を追加
     vis_dataloader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=CONFIG["NUM_WORKERS"], pin_memory=True) # ★ 高速化: pin_memory=True を追加
     
+    # --- ★ 変更: configからモデル設定を読み込む ---
+    model_config = CONFIG.get("MODEL", {})
+    unet_config = model_config.get("UNET", {})
+    cond_enc_config = model_config.get("CONDITIONING_ENCODER", {})
+
+    # --- ★ 変更: Optunaのパラメータに基づいてU-Netの構成を決定 ---
+    if model_scale == "small":
+        num_channels = unet_config.get("NUM_CHANNELS", (32, 64, 128, 256))
+        attention_levels = unet_config.get("ATTENTION_LEVELS", (False, True, True, True))
+    elif model_scale == "medium":
+        num_channels = (48, 96, 192, 384) 
+        attention_levels = (False, True, True, True)
+    else: # large
+        num_channels = (64, 128, 256, 512)
+        attention_levels = (False, True, True, True)
     
+    num_res_blocks = unet_config.get("NUM_RES_BLOCKS", 2)
+    encoder_name = params["encoder"]
+    # ---------------------------------------------------------
+
     # --- ★ 変更点: モデルをCPU上でインスタンス化 ---
     if encoder_name == 'resnet':
-        conditioning_encoder = ConditioningEncoderResNet(output_dim=256)
+        conditioning_encoder = ConditioningEncoderResNet(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
     elif encoder_name == 'convnext':
-        conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=256)
+        conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
     elif encoder_name == 'efficientnet':
-        conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=256)
+        conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
 
+    # --- ★ 変更: 動的なモデル構成パラメータを渡す ---
     unet = DiffusionModelUNet(
         spatial_dims=3, in_channels=1, out_channels=1, with_conditioning=True,
-        num_channels=(32, 64, 128, 256),
-        attention_levels=(False, True, True, True),
-        num_res_blocks=2,
+        num_channels=tuple(num_channels),
+        attention_levels=tuple(attention_levels),
+        num_res_blocks=num_res_blocks,
         cross_attention_dim=conditioning_encoder.feature_dim
     )
     
     # --- ★ 変更点: 分散モデルラッパーを作成し、パラメータを収集 ---
     distributed_model = DistributedUNet(unet, conditioning_encoder)
     # --- ★ 追加: EMAモデルの初期化 ---
-    ema_model = EMA(distributed_model, decay=0.9999)
+    ema_model = EMA(distributed_model, decay=model_config.get("EMA_DECAY", 0.9999))
     distributed_model.ema = ema_model # distributed_modelからアクセスできるようにする
-    # ★ 高速化: torch.compile を適用
-    # distributed_model = torch.compile(distributed_model, mode="reduce-overhead")
-    # 注意: torch.compileはカスタムのforwardを持つモデルやcheckpointと競合する可能性があるため、まずはコメントアウト。
-    # 動作しない場合は、この行を無効にしてください。
+    # --- ★ パフォーマンス改善案: torch.compile を適用 ---
+    # PyTorch 2.0以降のJITコンパイラでモデルを最適化し、高速化します。
+    # print("🚀 Applying torch.compile() for performance optimization...")
+    # distributed_model = torch.compile(distributed_model, mode="reduce-overhead") # ★ 修正: inductor backendとの互換性問題のため一時的に無効化
     model_params = list(distributed_model.parameters())
     # --- ★ 変更: AMP安定化のため、epsを調整 ---
     optimizer = torch.optim.AdamW(model_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95), eps=1e-6)
@@ -205,11 +247,11 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     # --- WandB 初期化 (チェックポイント読み込み後) ---
     l2_end_epoch, l1_end_epoch = loss_phase_epochs
     config = {
-        "encoder": encoder_name, "trial_number": trial_number, 
+        "encoder": encoder_name, "trial_number": trial.number, 
         "loss_schedule": f"L2(->{l2_end_epoch})_L1(->{l1_end_epoch})_SSIM",
         **params
     }
-    run_name = f"trial-{trial_number}_enc-{encoder_name}_p-{params['patch_size']}"
+    run_name = f"trial-{trial.number}_scale-{model_scale}_enc-{encoder_name}_p-{params['patch_size']}"
     
     # ★ 変更点: 再開時はIDを指定し、新規時はIDを生成
     wandb.init(
@@ -222,32 +264,30 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
     if wandb_run_id is None:
         wandb_run_id = wandb.run.id # 新規実行時に生成されたIDを保存
 
+    # --- ★ 追加: WandBでモデルの勾配とパラメータを監視 ---
+    wandb.watch(distributed_model, log="all", log_freq=CONFIG["TRAINING"].get("VISUALIZATION_FREQ", 10) * len(train_dataloader))
+
     # --- ★ 変更: 勾配爆発のデバッグのため、Anomaly Detectionを有効化 ---
     # これによりNaN/Infを生成した操作のスタックトレースが出力されますが、学習は遅くなります。
     # torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(start_epoch, CONFIG["EPOCHS"]):
-        # --- ★ 追加: 可視化用のデータを準備 ---
-        # vis_dataloaderはshuffle=Falseなので、常に同じ検証データで可視化が行われる
-        # これにより、エポック間の比較が容易になる
-        fixed_vis_data = next(iter(vis_dataloader))
-
         distributed_model.train()
-        # --- ★ 変更: L2損失に一時的に固定 ---
-        # # 元のコード: 現在のエポックに基づいて損失タイプを決定
-        # if epoch < l2_end_epoch:
-        #     current_loss_type = 'l2'
-        # elif epoch < l1_end_epoch:
-        #     current_loss_type = 'l1'
-        # else:
-        #     current_loss_type = 'l1_ssim'
-        current_loss_type = 'l2' # L2損失に固定
+        # --- ★ 修正: 元の損失関数スケジュールに戻す ---
+        # 現在のエポックに基づいて損失タイプを決定
+        if epoch < l2_end_epoch:
+            current_loss_type = 'l2'
+        elif epoch < l1_end_epoch:
+            current_loss_type = 'l1'
+        else:
+            current_loss_type = 'l1_ssim'
 
         train_loss_epoch = 0.0
         
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{CONFIG['EPOCHS']} Training")
         for step, (ct_patch, drr1, drr2, pos_3d) in enumerate(progress_bar):
             ct_patch, drr1, drr2, pos_3d = ct_patch.to(device), drr1.to(device), drr2.to(device), pos_3d.to(device)
+            global_step = epoch * len(train_dataloader) + step
             noise = torch.randn_like(ct_patch)
             timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (ct_patch.shape[0],), device=ct_patch.device).long()
             noisy_ct = scheduler.add_noise(original_samples=ct_patch, noise=noise, timesteps=timesteps)
@@ -256,29 +296,59 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
             with torch.cuda.amp.autocast():
                 context = distributed_model.conditioning_encoder(drr1, drr2)
                 predicted_noise = checkpoint(distributed_model, noisy_ct, timesteps, context, pos_3d, use_reentrant=False)
+                loss_details = {}
+                
+                # --- ★ 修正: 損失関数のスケジュールロジックを正しく反映 ---
+                if current_loss_type == 'l1':
+                    loss = F.l1_loss(predicted_noise, noise)
+                elif current_loss_type == 'l2':
+                    loss = F.mse_loss(predicted_noise, noise)
+                else: # 'l1_ssim'
+                    # --- ★ 変更: L1, SSIM, フーリエ損失を組み合わせる ---
+                    weights = CONFIG["TRAINING"].get("LOSS_WEIGHTS", {"L1": 0.5, "SSIM": 0.5, "FOURIER": 0.0})
 
-            # --- ★ 変更: L2損失に一時的に固定 ---
-            loss = F.mse_loss(predicted_noise, noise)
-            # # 元のコード:
-            # if current_loss_type == 'l1':
-            #     loss = F.l1_loss(predicted_noise, noise)
-            # elif current_loss_type == 'l2':
-            #     loss = F.mse_loss(predicted_noise, noise)
-            # else: # 'l1_ssim'
-            #     l1_loss = F.l1_loss(predicted_noise, noise)
-            #     denoised_ct = scheduler.step(predicted_noise, timesteps, noisy_ct).pred_original_sample
-            #     ssim_loss = 1.0 - ssim_metric(denoised_ct, ct_patch)
-            #     loss = CONFIG["TRAINING"]["L1_SSIM_RATIO"] * l1_loss + (1 - CONFIG["TRAINING"]["L1_SSIM_RATIO"]) * ssim_loss
-            
+                    # 1. ピクセル空間でのL1損失
+                    loss_details["l1_loss"] = F.l1_loss(predicted_noise, noise)
+
+                    # 2. 知覚的損失 (SSIM)
+                    denoised_ct = scheduler.step(predicted_noise, timesteps, noisy_ct).pred_original_sample
+                    loss_details["ssim_loss"] = 1.0 - ssim_metric(denoised_ct, ct_patch)
+
+                    # 3. 周波数空間でのL1損失 (フーリエ損失)
+                    fft_predicted = torch.fft.fftn(predicted_noise, dim=[-3, -2, -1])
+                    fft_target = torch.fft.fftn(noise, dim=[-3, -2, -1])
+                    loss_details["fourier_loss"] = F.l1_loss(torch.abs(fft_predicted), torch.abs(fft_target))
+
+                    # 4. 各損失を重み付けして合計
+                    loss = (weights["L1"] * loss_details["l1_loss"] + 
+                            weights["SSIM"] * loss_details["ssim_loss"] + 
+                            weights["FOURIER"] * loss_details["fourier_loss"])
+
             # 勾配蓄積のために損失をスケーリング
-            loss = loss / gradient_accumulation_steps
+            scaled_loss = loss / gradient_accumulation_steps
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n🔥 NaN or Inf loss detected at epoch {epoch+1}, step {step}. Aborting trial.")
+            if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
+                # --- ★ 変更: エラーをWandBに記録し、無限大の損失を返してOptunaに失敗を伝える ---
+                print(f"\n🔥 NaN or Inf loss detected at epoch {epoch+1}, step {step}. Pruning trial.")
+                # --- ★ 変更: 発散時の詳細ログ ---
+                log_data = {
+                    "train_loss": float('inf'), 
+                    "val_loss": float('inf'), 
+                    "epoch": epoch, 
+                    "status": "pruned_nan_loss",
+                    **{f"nan_loss_detail/{k}": v.item() if torch.is_tensor(v) else v for k, v in loss_details.items()}
+                }
+                wandb.log(log_data, step=global_step)
+                wandb.summary["status"] = "pruned_nan_loss"
+                wandb.summary.update({f"final_{k}": v for k, v in params.items()})
+                wandb.summary.update({f"final_loss_weight_{k}": v for k, v in CONFIG["TRAINING"]["LOSS_WEIGHTS"].items()})
+                # Optunaにこのトライアルが失敗したことを伝えるために大きな値を返す
+                # trial.report(float('inf'), step) # Optunaの枝刈り機能を使う場合
+                # wandb.finish(exit_code=1) # 終了コード1でWandBを終了
                 return float('inf')
             
             # --- ★ 変更: scalerを使って勾配を計算 ---
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
 
             train_loss_epoch += loss.item() * gradient_accumulation_steps # スケールを元に戻して加算
 
@@ -289,7 +359,8 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 scaler.unscale_(optimizer)
                 
                 # 2. 勾配をクリッピングする (inf/nanチェックも兼ねる)
-                torch.nn.utils.clip_grad_norm_(model_params, CONFIG["MAX_GRAD_NORM"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(model_params, CONFIG["MAX_GRAD_NORM"])
+                wandb.log({"details/grad_norm": grad_norm.item()}, step=global_step)
 
                 # 3. optimizerを更新 (scalerがinf/nanを検知したらスキップする)
                 scaler.step(optimizer)
@@ -298,12 +369,27 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 scaler.update()
                 ema_model.update()
                 optimizer.zero_grad()
+            
+            # --- ★ 追加: ステップごとの詳細な損失をログ ---
+            if (step + 1) % gradient_accumulation_steps == 0:
+                log_step_data = {"details/step_loss": loss.item()}
+                if loss_details:
+                    log_step_data.update({f"details/loss_{k}": v.item() for k, v in loss_details.items()})
+                wandb.log(log_step_data, step=global_step)
+            
+            # --- ★ 追加: メモリ解放 ---
+            # ステップごとに不要になったテンソルを明示的に削除
+            del ct_patch, drr1, drr2, pos_3d, noise, noisy_ct, context, predicted_noise, loss, scaled_loss
+            if 'denoised_ct' in locals(): del denoised_ct
+            if 'fft_predicted' in locals(): del fft_predicted, fft_target
         
-        avg_val_loss = evaluate_epoch(device, distributed_model, scheduler, val_dataloader)
+        avg_val_loss = evaluate_epoch(device, distributed_model, scheduler, val_dataloader, trial, epoch)
         
         avg_train_loss = train_loss_epoch / len(train_dataloader)
         print(f"Epoch {epoch+1}/{CONFIG['EPOCHS']} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-        wandb.log({"train_loss": avg_train_loss, "val_loss": avg_val_loss, "epoch": epoch}, step=epoch)
+        # --- ★ 変更: エポックごとのログに学習率を追加 ---
+        wandb.log({"train_loss": avg_train_loss, "val_loss": avg_val_loss, "epoch": epoch,
+                   "learning_rate": optimizer.param_groups[0]['lr']}, step=global_step)
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -341,7 +427,9 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
         # または、最終エポックの場合に実行
         if (visualization_freq > 0 and (epoch + 1) % visualization_freq == 0) or ((epoch + 1) == CONFIG["EPOCHS"]):
             print(f"--- 🖼️ Running visualization for epoch {epoch + 1} ---")
+            # --- ★ 変更: 可視化直前にデータをロード ---
             try:
+                fixed_vis_data = next(iter(vis_dataloader))
                 vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d = fixed_vis_data
                 generate_and_evaluate(
                     device,
@@ -352,15 +440,22 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                     vis_drr2,
                     vis_pos_3d,
                     epoch + 1, # 現在のエポック番号を渡す
-                    trial_number, SAVE_PATH,
+                    trial.number, SAVE_PATH,
                     model_for_inference=distributed_model
                 )
             except Exception as e:
                 print(f"❌ An error occurred during periodic visualization at epoch {epoch + 1}: {e}")
+            finally:
+                # --- ★ 追加: 可視化データのメモリ解放 ---
+                if 'fixed_vis_data' in locals(): del fixed_vis_data
+                if 'vis_ct_full' in locals(): del vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d
     
+        # --- ★ 追加: エポック終了時にメモリをクリーンアップ ---
+        gc.collect()
+        torch.cuda.empty_cache()
     
     if best_epoch != -1:
-        print(f"✨ Generating final visualization for Trial {trial_number} with best weights (from epoch {best_epoch})...")
+        print(f"✨ Generating final visualization for Trial {trial.number} with best weights (from epoch {best_epoch})...")
         try:
             fixed_vis_data = next(iter(vis_dataloader))
             vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d = fixed_vis_data
@@ -374,9 +469,10 @@ def train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_nam
                 vis_drr2,
                 vis_pos_3d,
                 best_epoch, 
-                trial_number, SAVE_PATH,
-                model_for_inference=distributed_model # ★ 修正: 辞書ではなく、DistributedUNetインスタンスを直接渡す
-            )
+                trial.number, SAVE_PATH,
+                model_for_inference=distributed_model, # ★ 修正: 辞書ではなく、DistributedUNetインスタンスを直接渡す
+                inference_steps=200 # 最終評価ではステップ数を増やして高品質化
+           )
         except Exception as e:
             print(f"An error occurred during final visualization: {e}")
     else:
@@ -447,26 +543,6 @@ def main(args):
         print(f"  -> Reduced to {len(train_paths)} training samples and {len(val_paths)} validation samples.")
 
     # Optuna学習ループ
-    # config.ymlから設定を読み込む
-    encoder_name = CONFIG["TRAINING"]["ENCODER"]
-    loss_phase_epochs = CONFIG["TRAINING"]["LOSS_PHASE_EPOCHS"]
-    
-    # --- ★ 変更点: Optunaを無効化し、config.ymlから直接パラメータを読み込む ---
-    print("--- Running a single training session (Optuna is disabled) ---")
-    
-    # パラメータをconfig.ymlから取得 (Optuna無効化のため)
-    params = {
-        "patch_size": CONFIG["TRAINING"]["PATCH_SIZE"],
-        "learning_rate": CONFIG["TRAINING"]["LEARNING_RATE"],
-        "weight_decay": CONFIG["TRAINING"]["WEIGHT_DECAY"],
-        "gradient_accumulation_steps": CONFIG["TRAINING"]["GRADIENT_ACCUMULATION_STEPS"],
-        "patch_overlap": CONFIG["TRAINING"].get("patch_overlap", 0.5), # configから取得、なければ0.5
-        "blend_mode": CONFIG["TRAINING"].get("blend_mode", "cosine"), # configから取得、なければcosine
-    }
-    
-    # トライアル番号をコマンドライン引数から取得
-    trial_number = args.trial_number
-    
     if args.evaluate_only:
         # --- 評価モード ---
         if not args.checkpoint_dir:
@@ -475,6 +551,7 @@ def main(args):
         print(f"\n--- Running in EVALUATION-ONLY mode for checkpoint: {args.checkpoint_dir} ---")
         set_seed(CONFIG["SEED"])
         
+        encoder_name = CONFIG["TRAINING"]["ENCODER"]
         # 1. デバイスとデータローダーの準備
         device = torch.device("cuda:0")
         vis_dataset = Preprocessed_CT_DRR_Dataset(val_paths, drr_dir, patch_size=None)
@@ -482,6 +559,15 @@ def main(args):
         fixed_vis_data = next(iter(vis_dataloader))
         vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d = fixed_vis_data
 
+        # 評価時はconfig.ymlのTRAININGセクションのパラメータを使用
+        params = {
+            "patch_size": CONFIG["TRAINING"]["PATCH_SIZE"],
+            "patch_overlap": CONFIG["TRAINING"].get("patch_overlap", 0.5),
+            "blend_mode": CONFIG["TRAINING"].get("blend_mode", "cosine"),
+            # 以下はgenerate_and_evaluateで直接は使われないが、念のため設定
+            "learning_rate": CONFIG["TRAINING"]["LEARNING_RATE"],
+            "weight_decay": CONFIG["TRAINING"]["WEIGHT_DECAY"],
+        }
         # 2. モデルのインスタンス化
         if encoder_name == 'resnet':
             conditioning_encoder = ConditioningEncoderResNet(output_dim=256)
@@ -526,16 +612,79 @@ def main(args):
         with open(checkpoint_path / "checkpoint_info.json", 'r') as f:
             best_epoch = json.load(f).get('epoch', 'N/A')
 
-        # 4. 評価関数を実行
-        generate_and_evaluate(device, {"encoder": encoder_name, **params}, "", vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d, best_epoch, trial_number, str(checkpoint_path), model_for_inference=distributed_model)
+        # 4. 評価関数を実行 (trial_numberは0で固定)
+        generate_and_evaluate(device, {"encoder": encoder_name, **params}, "", vis_ct_full, vis_drr1, vis_drr2, vis_pos_3d, best_epoch, 0, str(checkpoint_path), model_for_inference=distributed_model)
         print("\n--- Evaluation Finished ---")
     else:
-        # --- 学習モード ---
+        # --- ★ 変更: Optunaによる学習モード ---
         set_seed(CONFIG["SEED"])
-        print(f"--- Running in TRAINING mode (Seed: {CONFIG['SEED']}) ---")
-        result = train_and_evaluate(params, trial_number, train_paths, val_paths, encoder_name, loss_phase_epochs, data_config, args.checkpoint_dir)
-        print("\n--- Training Finished ---")
-        print(f"Final Best Validation Loss: {result:.4f}")
+        print(f"--- Running Optuna hyperparameter search (Seed: {CONFIG['SEED']}) ---")
+
+        # 固定パラメータをconfigから読み込む
+        loss_phase_epochs = CONFIG["TRAINING"]["LOSS_PHASE_EPOCHS"]
+        optuna_params = CONFIG["OPTUNA"]["PARAMS"]
+
+        def objective(trial):
+            # Optunaからハイパーパラメータを提案
+            params = {
+                "encoder": trial.suggest_categorical("encoder", optuna_params["encoder"]),
+                "model_scale": trial.suggest_categorical("model_scale", optuna_params["model_scale"]),
+                "patch_size": trial.suggest_categorical("patch_size", optuna_params["patch_size"]),
+                # --- ★ 修正: Optunaの非推奨APIを新しいAPIに変更 ---
+                "learning_rate": trial.suggest_float("learning_rate", *optuna_params["learning_rate"], log=True),
+                "weight_decay": trial.suggest_float("weight_decay", *optuna_params["weight_decay"], log=True),
+                "gradient_accumulation_steps": trial.suggest_categorical("gradient_accumulation_steps", optuna_params["gradient_accumulation_steps"]),
+                "patch_overlap": CONFIG["TRAINING"]["patch_overlap"], # ★ 変更: configから固定値を読み込む
+                "blend_mode": trial.suggest_categorical("blend_mode", optuna_params["blend_mode"]),
+                "scheduler_name": trial.suggest_categorical("scheduler_name", optuna_params["scheduler_name"]),
+            }
+            
+            # 損失の重みを提案し、合計が1になるように正規化
+            l1 = trial.suggest_float("loss_weight_l1", *optuna_params["loss_weight_l1"])
+            ssim = trial.suggest_float("loss_weight_ssim", *optuna_params["loss_weight_ssim"])
+            fourier = trial.suggest_float("loss_weight_fourier", *optuna_params["loss_weight_fourier"])
+            total_weight = l1 + ssim + fourier
+            CONFIG["TRAINING"]["LOSS_WEIGHTS"] = {
+                "L1": l1 / total_weight,
+                "SSIM": ssim / total_weight,
+                "FOURIER": fourier / total_weight,
+            }
+
+            # --- ★ 変更: エラーハンドリングを追加 ---
+            try:
+                # train_and_evaluateはチェックポイントからの再開をサポート
+                # Optunaは通常、各トライアルを独立して実行するため、ここではresume_from_checkpoint=Noneとする
+                # もしトライアル自体の再開を実装したい場合は、より高度な状態管理が必要
+                result = train_and_evaluate(params, trial, train_paths, val_paths, loss_phase_epochs, data_config, resume_from_checkpoint=None)
+                
+                # --- ★ 追加: 枝刈りのチェック ---
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+
+                return result
+            except optuna.exceptions.TrialPruned:
+                print(f"🍃 Trial {trial.number} pruned. 🍃")
+                return float('inf')
+            except Exception as e:
+                print(f"🔥🔥🔥 Trial {trial.number} failed with an exception: {e} 🔥🔥🔥")
+                # エラーが発生したトライアルをFAILとして記録し、次のトライアルに進む
+                # WandBにも失敗を記録
+                # --- ★ 変更: OOMエラーを明示的にログ ---
+                error_msg = str(e)
+                is_oom = "out of memory" in error_msg.lower()
+                run = wandb.init(project=CONFIG["PROJECT_NAME"], name=f"trial-{trial.number}-{'OOM' if is_oom else 'FAILED'}", config=params, reinit=True)
+                wandb.log({"status": "oom" if is_oom else "failed", "error_message": error_msg})
+                # --- ★ 追加: 失敗時のハイパーパラメータをサマリーに記録 ---
+                wandb.summary["status"] = "oom" if is_oom else "failed"
+                wandb.summary.update({f"failed_param_{k}": v for k, v in trial.params.items()})
+                run.finish(exit_code=1)
+                return float('inf') # Optunaに大きな損失値を返して失敗を伝える
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=CONFIG["OPTUNA"]["N_TRIALS"])
+        print("\n--- Optuna Search Finished ---")
+        print(f"Best trial: {study.best_trial.value}")
+        print(f"Best params: {study.best_trial.params}")
 
 if __name__ == '__main__':
     set_seed(CONFIG["SEED"])

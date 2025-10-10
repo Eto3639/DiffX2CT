@@ -15,6 +15,10 @@ from torch.cuda.amp import autocast
 from inferers import SlidingWindowInferer
 from models import DistributedUNet
 
+# --- ★ 追加: config.ymlから設定を読み込む ---
+from utils import load_config
+CONFIG = load_config()
+
 
 class EMA:
     """
@@ -64,6 +68,61 @@ class EMA:
     def load_state_dict(self, state_dict):
         self.shadow = state_dict
 
+
+# --- リファクタリング: 評価レポート生成のヘルパー関数 ---
+
+def _plot_mpr_views(fig, gs, gt_hu, gen_hu, vmin, vmax):
+    """MPR（3断面）の画像を描画する"""
+    z, y, x = gt_hu.shape
+    slice_ax, slice_cor, slice_sag = z // 2, y // 2, x // 2
+
+    views = {
+        'Axial': (gt_hu[slice_ax, :, :], gen_hu[slice_ax, :, :], gs[0, 0], gs[0, 1]),
+        'Coronal': (np.flipud(gt_hu[:, slice_cor, :]), np.flipud(gen_hu[:, slice_cor, :]), gs[1, 0], gs[1, 1]),
+        'Sagittal': (np.fliplr(np.flipud(gt_hu[:, :, slice_sag])), np.fliplr(np.flipud(gen_hu[:, :, slice_sag])), gs[2, 0], gs[2, 1])
+    }
+
+    for title, (gt_img, gen_img, gs_gt, gs_gen) in views.items():
+        ax_gt = fig.add_subplot(gs_gt)
+        ax_gt.imshow(gt_img, cmap='gray', vmin=vmin, vmax=vmax)
+        ax_gt.set_title(f'Ground Truth {title}', color='cyan')
+        ax_gt.axis('off')
+
+        ax_gen = fig.add_subplot(gs_gen)
+        ax_gen.imshow(gen_img, cmap='gray', vmin=vmin, vmax=vmax)
+        ax_gen.set_title(f'Generated {title}', color='magenta')
+        ax_gen.axis('off')
+
+def _plot_histograms(fig, gs, gt_non_air, gen_non_air):
+    """HU値のヒストグラムを描画する"""
+    hist_min = min(np.min(gt_non_air) if gt_non_air.size > 0 else 0, np.min(gen_non_air) if gen_non_air.size > 0 else 0)
+    hist_max = max(np.max(gt_non_air) if gt_non_air.size > 0 else 0, np.max(gen_non_air) if gen_non_air.size > 0 else 0)
+    hist_range = (hist_min - 50, hist_max + 50)
+
+    ax_hist_gt = fig.add_subplot(gs[0, 2]); ax_hist_gen = fig.add_subplot(gs[0, 3])
+    if gt_non_air.size > 0: ax_hist_gt.hist(gt_non_air.flatten(), bins=100, color='deepskyblue', range=hist_range)
+    ax_hist_gt.set_title("Ground Truth - HU Histogram", color='cyan'); ax_hist_gt.set_facecolor('darkgray'); ax_hist_gt.tick_params(colors='white')
+    if gen_non_air.size > 0: ax_hist_gen.hist(gen_non_air.flatten(), bins=100, color='orchid', range=hist_range)
+    ax_hist_gen.set_title("Generated - HU Histogram", color='magenta'); ax_hist_gen.set_facecolor('darkgray'); ax_hist_gen.tick_params(colors='white')
+
+def _plot_statistics_and_scores(fig, gs, scores, stats_gt, stats_gen):
+    """評価スコアと統計情報をテキストで描画する"""
+    ax_text = fig.add_subplot(gs[1:, 2:]); ax_text.axis('off')
+    report_text = (
+        f"--- Quality Metrics ---\n"
+        f"  SSIM: {scores['ssim']:.4f}\n"
+        f"  PSNR: {scores['psnr']:.2f} dB\n"
+        f"  MAE:  {scores['mae']:.2f} HU\n\n"
+        f"--- Statistics (HU, > {CONFIG['DATA'].get('AIR_THRESHOLD', -1000)}) ---\n"
+        f"  [Ground Truth]\n"
+        f"    Mean / Std: {stats_gt.get('mean', 0):.2f} / {stats_gt.get('std', 0):.2f}\n"
+        f"    Min / Max:  {stats_gt.get('min', 0):.0f} / {stats_gt.get('max', 0):.0f}\n\n"
+        f"  [Generated]\n"
+        f"    Mean / Std: {stats_gen.get('mean', 0):.2f} / {stats_gen.get('std', 0):.2f}\n"
+        f"    Min / Max:  {stats_gen.get('min', 0):.0f} / {stats_gen.get('max', 0):.0f}\n"
+    )
+    ax_text.text(0.05, 0.7, report_text, color='white', fontfamily='monospace', fontsize=14, va='top')
+
 def calculate_mae(image_true, image_test):
     """平均絶対誤差 (MAE) を計算する"""
     return np.mean(np.abs(image_true - image_test))
@@ -84,94 +143,39 @@ def create_evaluation_report(generated_hu_np, ground_truth_hu_np, ssim_score, ps
     Returns:
         matplotlib.figure.Figure: 生成されたレポートのFigureオブジェクト
     """
-    # 統計情報を計算 (空気以外)
-    non_air_voxels_gen = generated_hu_np[generated_hu_np > -1000]
+    # --- 1. 統計情報とスコアの準備 ---
+    air_threshold = CONFIG["DATA"].get("AIR_THRESHOLD", -1000)
+    non_air_voxels_gen = generated_hu_np[generated_hu_np > air_threshold]
+    non_air_voxels_gt = ground_truth_hu_np[ground_truth_hu_np > air_threshold]
+
     stats_gen = {
         'mean': np.mean(non_air_voxels_gen), 'std': np.std(non_air_voxels_gen),
         'min': np.min(non_air_voxels_gen), 'max': np.max(non_air_voxels_gen)
     } if non_air_voxels_gen.size > 0 else {}
-
-    non_air_voxels_gt = ground_truth_hu_np[ground_truth_hu_np > -1000]
     stats_gt = {
         'mean': np.mean(non_air_voxels_gt), 'std': np.std(non_air_voxels_gt),
         'min': np.min(non_air_voxels_gt), 'max': np.max(non_air_voxels_gt)
     } if non_air_voxels_gt.size > 0 else {}
+    scores = {'ssim': ssim_score, 'psnr': psnr_score, 'mae': mae_score}
 
+    # --- 2. 描画のセットアップ ---
     fig = plt.figure(figsize=(20, 14), facecolor='black')
     gs = plt.GridSpec(3, 4, figure=fig)
-    
-    z, y, x = ground_truth_hu_np.shape
-    slice_ax, slice_cor, slice_sag = z // 2, y // 2, x // 2
-    vmin, vmax = -1024, 300 # 表示ウィンドウ
+    vmin = CONFIG["DATA"].get("VIS_WINDOW_MIN", -1024)
+    vmax = CONFIG["DATA"].get("VIS_WINDOW_MAX", 300)
 
-    views = {
-        'Axial': (ground_truth_hu_np[slice_ax, :, :], generated_hu_np[slice_ax, :, :], gs[0, 0], gs[0, 1]),
-        'Coronal': (np.flipud(ground_truth_hu_np[:, slice_cor, :]), np.flipud(generated_hu_np[:, slice_cor, :]), gs[1, 0], gs[1, 1]),
-        'Sagittal': (np.fliplr(np.flipud(ground_truth_hu_np[:, :, slice_sag])), np.fliplr(np.flipud(generated_hu_np[:, :, slice_sag])), gs[2, 0], gs[2, 1])
-    }
+    # --- 3. ヘルパー関数を呼び出して各パーツを描画 ---
+    _plot_mpr_views(fig, gs, ground_truth_hu_np, generated_hu_np, vmin, vmax)
+    _plot_histograms(fig, gs, non_air_voxels_gt, non_air_voxels_gen)
+    _plot_statistics_and_scores(fig, gs, scores, stats_gt, stats_gen)
 
-    for title, (gt_img, gen_img, gs_gt, gs_gen) in views.items():
-        ax_gt = fig.add_subplot(gs_gt)
-        ax_gt.imshow(gt_img, cmap='gray', vmin=vmin, vmax=vmax)
-        ax_gt.set_title(f'Ground Truth {title}', color='cyan')
-        ax_gt.axis('off')
-
-        ax_gen = fig.add_subplot(gs_gen)
-        ax_gen.imshow(gen_img, cmap='gray', vmin=vmin, vmax=vmax)
-        ax_gen.set_title(f'Generated {title}', color='magenta')
-        ax_gen.axis('off')
-
-    # 8. 統計情報を計算 (空気以外)
-    print("  ⏳ Calculating statistics (excluding air)...")
-    non_air_voxels_gen = generated_hu_np[generated_hu_np > -1000]
-    stats_gen = {
-        'mean': np.mean(non_air_voxels_gen), 'std': np.std(non_air_voxels_gen),
-        'min': np.min(non_air_voxels_gen), 'max': np.max(non_air_voxels_gen)
-    } if non_air_voxels_gen.size > 0 else {}
-
-    non_air_voxels_gt = ground_truth_hu_np[ground_truth_hu_np > -1000]
-    stats_gt = {
-        'mean': np.mean(non_air_voxels_gt), 'std': np.std(non_air_voxels_gt),
-        'min': np.min(non_air_voxels_gt), 'max': np.max(non_air_voxels_gt)
-    } if non_air_voxels_gt.size > 0 else {}
-
-    # --- ★ 変更点: ヒストグラムのX軸を統一 ---
-    # 両方のデータセットから最小値と最大値を計算して、ヒストグラムの描画範囲を決定する
-    hist_min = min(stats_gt.get('min', 0), stats_gen.get('min', 0))
-    hist_max = max(stats_gt.get('max', 0), stats_gen.get('max', 0))
-    # 安全マージンを追加
-    hist_range = (hist_min - 50, hist_max + 50)
-
-    # ヒストグラム (統一した範囲で描画)
-    ax_hist_gt = fig.add_subplot(gs[0, 2]); ax_hist_gen = fig.add_subplot(gs[0, 3])
-    if stats_gt: ax_hist_gt.hist(non_air_voxels_gt.flatten(), bins=100, color='deepskyblue', range=hist_range)
-    ax_hist_gt.set_title("Ground Truth - HU Histogram", color='cyan'); ax_hist_gt.set_facecolor('darkgray'); ax_hist_gt.tick_params(colors='white')
-    if stats_gen: ax_hist_gen.hist(non_air_voxels_gen.flatten(), bins=100, color='orchid', range=hist_range)
-    ax_hist_gen.set_title("Generated - HU Histogram", color='magenta'); ax_hist_gen.set_facecolor('darkgray'); ax_hist_gen.tick_params(colors='white')
-
-    # 統計情報とスコア
-    ax_text = fig.add_subplot(gs[1:, 2:]); ax_text.axis('off')
-    report_text = (
-        f"--- Quality Metrics ---\n"
-        f"  SSIM: {ssim_score:.4f}\n"
-        f"  PSNR: {psnr_score:.2f} dB\n"
-        f"  MAE:  {mae_score:.2f} HU\n\n"
-        f"--- Statistics (HU, > -1000) ---\n"
-        f"  [Ground Truth]\n"
-        f"    Mean / Std: {stats_gt.get('mean', 0):.2f} / {stats_gt.get('std', 0):.2f}\n"
-        f"    Min / Max:  {stats_gt.get('min', 0):.0f} / {stats_gt.get('max', 0):.0f}\n\n"
-        f"  [Generated]\n"
-        f"    Mean / Std: {stats_gen.get('mean', 0):.2f} / {stats_gen.get('std', 0):.2f}\n"
-        f"    Min / Max:  {stats_gen.get('min', 0):.0f} / {stats_gen.get('max', 0):.0f}\n"
-    )
-    ax_text.text(0.05, 0.7, report_text, color='white', fontfamily='monospace', fontsize=14, va='top')
-
+    # --- 4. 最終的な調整 ---
     fig.suptitle(title_prefix, color='white', fontsize=20)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
 
 
-def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, pos_3d, best_epoch, trial_number, save_dir, model_for_inference):
+def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, pos_3d, best_epoch, trial_number, save_dir, model_for_inference, inference_steps=50):
     print(f"--- Starting Generation & Evaluation on device: {device} ---")
 
     vis_dir = Path(save_dir) / "evaluation" # 保存先ディレクトリ名を変更
@@ -226,7 +230,7 @@ def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, p
     # 5. 推論を実行
     with torch.no_grad(), autocast(enabled=False): # 推論時は混合精度をオフ
         initial_noise = torch.randn_like(ct_full)
-        scheduler.set_timesteps(num_inference_steps=50)
+        scheduler.set_timesteps(num_inference_steps=inference_steps)
         image = initial_noise
 
         for t in tqdm(scheduler.timesteps, desc=f"🖼️ Visualizing Trial {trial_number} (Full Volume)"):
@@ -259,8 +263,8 @@ def generate_and_evaluate(device, params, scheduler_name, ct_full, drr1, drr2, p
 
     print("  De-normalizing images to HU range...")
     # ターゲットのHU範囲
-    min_hu = -1024
-    max_hu = 1500
+    min_hu = CONFIG["DATA"].get("HU_MIN", -1024)
+    max_hu = CONFIG["DATA"].get("HU_MAX", 1500)
 
     # 6b. [0, 1] の範囲から [min_hu, max_hu] の範囲にスケール変換
     generated_hu_np = image.squeeze().cpu().numpy() * (max_hu - min_hu) + min_hu

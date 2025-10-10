@@ -1,5 +1,5 @@
 SEED: 42
-PROJECT_NAME: "3D-CT-Diffusion-Unet-validation-visualize"
+PROJECT_NAME: "3D-CT-Diffusion-Unet-optuna-fourierLoss"
 EPOCHS: 30
 BATCH_SIZE: 1
 VALIDATION_SPLIT: 0.2
@@ -9,31 +9,66 @@ NUM_WORKERS: 8
 DATA:
   PT_DATA_DIR: "/workspace/data/LIDC/dataset_256/CT_pt"
   DRR_DIR: "/workspace/data/LIDC/dataset_256/DRR_mod"
-  DATA_RATIO: 0.4
+  DATA_RATIO: 0.4 #学習に使用するデータセットの割合 (0.0 ~ 1.0)
   # ★ 追加: データセットのターゲットサイズを定義
   # CTボリュームのサイズ (Depth, Height, Width)
   TARGET_VOLUME_SIZE: [256, 256, 256]
   # DRR画像のサイズ (Height, Width)
   TARGET_DRR_SIZE: [256, 256]
+  # ★ 追加: HU値の範囲と可視化設定
+  HU_MIN: -1024  # 逆正規化後のHU値の最小値
+  HU_MAX: 1500   # 逆正規化後のHU値の最大値
+  VIS_WINDOW_MIN: -1024 # 可視化レポートの表示ウィンドウ最小値
+  VIS_WINDOW_MAX: 300    # 可視化レポートの表示ウィンドウ最大値
+  AIR_THRESHOLD: -1000 # 統計計算時に空気とみなすHU値の閾値
+
+MODEL:
+  UNET:
+    NUM_CHANNELS: [32, 64, 128, 256]
+    ATTENTION_LEVELS: [false, true, true, true]
+    NUM_RES_BLOCKS: 2
+  CONDITIONING_ENCODER:
+    OUTPUT_DIM: 256
+  EMA_DECAY: 0.9999 # 指数移動平均の減衰率
+
 
 TRAINING:
   ENCODER: "convnext"  # 使用するエンコーダー (resnet, convnext, efficientnet)
   PATCH_SIZE: 128 # パッチサイズ (TARGET_VOLUME_SIZEより小さい必要があります)
   LOSS_PHASE_EPOCHS: [10, 20] # 損失関数を切り替えるエポック
-  L1_SSIM_RATIO: 0.5 # L1損失とSSIM損失の割合 (L1 * ratio + SSIM * (1-ratio))
+  # --- ★ 変更: 複合損失の各項の重みを定義 ---
+  # L1_SSIM_RATIO は廃止し、より柔軟な重み付けに変更
+  LOSS_WEIGHTS:
+    L1: 0.5      # ピクセル空間でのL1損失の重み
+    SSIM: 0.2    # 知覚的類似度(SSIM)損失の重み
+    FOURIER: 0.3 # 周波数空間でのL1損失の重み
   # --- Optunaから移動したハイパーパラメータ ---
   LEARNING_RATE: 0.0002
   WEIGHT_DECAY: 0.01
   GRADIENT_ACCUMULATION_STEPS: 8
-  patch_overlap: 0.25 # パッチのオーバーラップ率 (0.0 ~ 1.0)
+  patch_overlap: 0.5 # ★ 変更: パッチのオーバーラップ率 (0.0 ~ 1.0) をここで固定
   blend_mode: 'cosine' # 推論時のブレンディングモード ('constant', 'gaussian', 'cosine')
   scheduler_name: 'cosine' # スケジューラの種類 ('linear', 'cosine')
-  VISUALIZATION_FREQ: 10 # エポックごとに可視化を行う頻度
+  VISUALIZATION_FREQ: 10 # エポックごとに可視化を行う頻度 (0で無効)
 
 OPTUNA:
   N_TRIALS: 20 # Optunaの試行回数
   PARAMS:
     # 探索するハイパーパラメータの範囲
-    gradient_accumulation_steps: [1, 2, 4, 8] # (参考: Optuna使用時の設定)
-    lr: [1.0e-5, 5.0e-4]
-    weight_decay: [1.0e-6, 1.0e-2]
+    encoder: ["resnet", "convnext", "efficientnet"]
+    patch_size: [96, 128, 160]
+    learning_rate: [1.0e-5, 5.0e-4] # log uniform
+    weight_decay: [1.0e-6, 1.0e-2]  # log uniform
+    gradient_accumulation_steps: [1, 2, 4, 8]
+    blend_mode: ['constant', 'gaussian', 'cosine']
+    scheduler_name: ['linear', 'cosine']
+    # 損失の重みも探索範囲に含める (合計が1になるように正規化)
+    loss_weight_l1: [0.1, 1.0]
+    loss_weight_ssim: [0.1, 1.0]
+    loss_weight_fourier: [0.1, 1.0]
+    # --- ★ 追加: モデルサイズ関連のパラメータ ---
+    # "small", "medium", "large" の3つのスケールを定義# (32, 64, 128, 256), (48, 96, 192, 384), (64, 128, 256, 512)
+    model_scale: ["small"]
+    # model_scale: ["small", "medium", "large"]
+    # num_res_blocks: [1, 2] # 各レベルのResNetブロック数
+    # attention_levels: ["none", "last", "last_two"] # Attentionを適用するレベル

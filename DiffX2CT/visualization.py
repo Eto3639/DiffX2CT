@@ -153,24 +153,30 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode, eva
     print(f"\nPreparing model for {gpu_mode.upper()} GPU mode...")
     model_for_inference = None
 
+    # --- ★ 追加: configからモデル設定を読み込む ---
+    model_config = CONFIG.get("MODEL", {})
+    unet_config = model_config.get("UNET", {})
+    cond_enc_config = model_config.get("CONDITIONING_ENCODER", {})
+
     if gpu_mode == 'multi':
         print("  Instantiating and loading DistributedUNet for 3 GPUs...")
         if encoder_name == 'resnet':
-            conditioning_encoder = ConditioningEncoderResNet(output_dim=256)
+            conditioning_encoder = ConditioningEncoderResNet(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         elif encoder_name == 'convnext':
-            conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=256)
+            conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         else: # efficientnet
-            conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=256)
+            conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         
         # ★ 修正: ダミーではなく、完全なU-Netモデルをインスタンス化する
         unet_full = DiffusionModelUNet(
             spatial_dims=3, in_channels=1, out_channels=1, with_conditioning=True,
-            num_channels=(32, 64, 128, 256), attention_levels=(False, True, True, True),
-            num_res_blocks=2, cross_attention_dim=conditioning_encoder.feature_dim
+            num_channels=tuple(unet_config.get("NUM_CHANNELS", (32, 64, 128, 256))),
+            attention_levels=tuple(unet_config.get("ATTENTION_LEVELS", (False, True, True, True))),
+            num_res_blocks=unet_config.get("NUM_RES_BLOCKS", 2),
+            cross_attention_dim=conditioning_encoder.feature_dim
         )
         
         distributed_model = DistributedUNet(unet_full, conditioning_encoder)
-        
         # 分散モデルの重みをロード
         distributed_model.conditioning_encoder.load_state_dict(torch.load(Path(checkpoint_dir) / "conditioning_encoder.pth", map_location=distributed_model.device0))
         distributed_model.time_mlp.load_state_dict(torch.load(Path(checkpoint_dir) / "unet_time_mlp.pth", map_location=distributed_model.device0))
@@ -194,16 +200,18 @@ def test_visualization(trial_number, checkpoint_dir, encoder_name, gpu_mode, eva
     else: # gpu_mode == 'single'
         print(f"  Instantiating and loading models onto single device: {device}...")
         if encoder_name == 'resnet':
-            conditioning_encoder = ConditioningEncoderResNet(output_dim=256)
+            conditioning_encoder = ConditioningEncoderResNet(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         elif encoder_name == 'convnext':
-            conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=256)
+            conditioning_encoder = ConditioningEncoderConvNeXt(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         else: # efficientnet
-            conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=256)
+            conditioning_encoder = ConditioningEncoderEfficientNetV2(output_dim=cond_enc_config.get("OUTPUT_DIM", 256))
         
         unet = DiffusionModelUNet(
             spatial_dims=3, in_channels=1, out_channels=1, with_conditioning=True,
-            num_channels=(32, 64, 128, 256), attention_levels=(False, True, True, True),
-            num_res_blocks=2, cross_attention_dim=conditioning_encoder.feature_dim
+            num_channels=tuple(unet_config.get("NUM_CHANNELS", (32, 64, 128, 256))),
+            attention_levels=tuple(unet_config.get("ATTENTION_LEVELS", (False, True, True, True))),
+            num_res_blocks=unet_config.get("NUM_RES_BLOCKS", 2),
+            cross_attention_dim=conditioning_encoder.feature_dim
         )
         
         # 単一デバイスに全パーツをロード

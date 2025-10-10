@@ -121,7 +121,10 @@ class AttentionBlock3D(nn.Module):
     def __init__(self, channels, num_heads=8, num_head_channels=32, context_dim=None):
         super().__init__()
         self.num_heads = num_heads
-        self.norm = nn.GroupNorm(32, channels)
+        # ★ 修正: num_groupsをチャンネル数と同じに設定し、インスタンス正規化と等価にする。
+        # これにより、チャンネル数が32や48など、どんな数であってもエラーを防ぎ、各チャンネルを独立して正規化する。
+        # チャンネル数が8より小さい場合に備え、最小値を8とする（通常は発生しない）。
+        self.norm = nn.GroupNorm(num_groups=max(8, channels), num_channels=channels)
         self.qkv = nn.Conv3d(channels, channels * 3, 1)
         self.attention = CrossAttention(channels, context_dim=context_dim)
         self.proj_out = nn.Conv3d(channels, channels, 1)
@@ -282,7 +285,9 @@ class DiffusionModelUNet(nn.Module):
 
         # 出力層
         self.out_conv = nn.Sequential(
-            nn.GroupNorm(num_groups=32, num_channels=num_channels[0]),
+            # ★ 修正: こちらも同様に、num_groupsをチャンネル数と同じに設定する。
+            # 最初のチャンネル数 num_channels[0] をグループ数として使用する。
+            nn.GroupNorm(num_groups=num_channels[0], num_channels=num_channels[0]),
             nn.SiLU(),
             nn.Conv3d(num_channels[0], out_channels, kernel_size=3, padding=1),
         )
